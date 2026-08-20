@@ -294,6 +294,19 @@ async def index(request):
         return redirect('/?m=game', status_code=303)
     else:
         return redirect('/?m=setup', status_code=303)
+        
+@app.route('/action/setup')
+async def index(request):
+    global systemMode
+    global systemStateMachine
+    global sensors
+    led.color("pink")
+    if systemMode == 1:
+        for sensor in sensors:
+            sensor.setMode(1)
+        systemMode = 0
+    systemStateMachine = 0
+    return  json.dumps(systemMode)
 
 @app.route('/API/playerlist')
 async def index(request):
@@ -309,8 +322,8 @@ async def api(request, ws):
     global systemStateMachine
     global sensors
     while True:
-        led.color("pink")
         if systemMode == 1:
+            led.color("pink")
             for sensor in sensors:
                 sensor.setMode(1)
             systemMode = 0
@@ -323,6 +336,7 @@ async def api(request, ws):
         await ws.send(response)
         await ws.receive()
         await asyncio.sleep(0.5)
+
 
 @app.route('/API/game')
 @with_websocket

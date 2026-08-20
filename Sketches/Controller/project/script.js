@@ -47,7 +47,7 @@ function submitThreshold() {
     })
     .then(data => {
         threshold = data;
-        console.log(threshold);
+        //console.log(threshold);
         thresholdrange.value = threshold;
         thresholdnumber.value = threshold;
         applythreshold.classList.remove("yellow");
@@ -66,7 +66,7 @@ function submitPenalty() {
     })
     .then(data => {
         penalty = data;
-        console.log(penalty);
+        //console.log(penalty);
         penaltynumber.value = penalty;
         applypenalty.classList.remove("yellow");
     })
@@ -228,6 +228,19 @@ function setup() {
         thresholdrange.value = threshold;
         applythreshold.classList.add("yellow");
     })
+    fetch('http://192.168.4.1:5000/action/setup')
+    .then(response => {
+        if (!response.ok) {
+            throw new Error("HTTP error " + response.status);
+        }
+        return response.text()
+    })
+    .then(data => {
+    })
+    .catch(function () {
+        this.dataError = true;
+    })
+
     fetch('http://192.168.4.1:5000/action/threshold')
     .then(response => {
         if (!response.ok) {
@@ -237,7 +250,7 @@ function setup() {
     })
     .then(data => {
         threshold = data;
-        console.log(threshold);
+        //console.log(threshold);
         thresholdrange.value = threshold;
         thresholdnumber.value = threshold;
     })
@@ -249,6 +262,7 @@ function setup() {
     penaltynumber.addEventListener("change",(e)=>{
         applypenalty.classList.add("yellow");
     })
+
     fetch('http://192.168.4.1:5000/action/penalty')
     .then(response => {
         if (!response.ok) {
@@ -258,12 +272,13 @@ function setup() {
     })
     .then(data => {
         penalty = data;
-        console.log(penalty);
+        //console.log(penalty);
         penaltynumber.value = penalty;
     })
     .catch(function () {
         this.dataError = true;
     })
+
     //const socket = new WebSocket('ws://' + location.host + '/API/sensors');
     socket = new WebSocket('ws://' + "192.168.4.1:5000" + '/API/sensors');
     timeout = setTimeout(lostConnection, 3000);
