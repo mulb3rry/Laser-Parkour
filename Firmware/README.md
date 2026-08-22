@@ -74,8 +74,10 @@ exceeds the maximum run time is automatically aborted.
 Invalid button events are ignored and logged: finish while no run is active,
 start while a run is active, and repeated button events caused by contact
 bounce. Start and finish buttons must be debounced in the node firmware. A
-default debounce interval of 50 ms is used and can later be adjusted at build
-time.
+press is accepted immediately on its first active edge so debounce does not add
+latency to the measured time. The node then ignores all button edges until the
+button has been continuously released for the default 50 ms release-debounce
+interval. The interval can later be adjusted at build time.
 
 ## System States
 
@@ -148,17 +150,20 @@ I2C address are configuration data rather than compile-time options.
 
 | Function | Pico GPIO | ATtiny pin | Notes |
 |---|---:|---|---|
-| SCL | 22 | PB2 | Controller is I2C master |
-| SDA | 21 | PB0 | Nodes are I2C slaves |
+| SCL | 17 | PB2 | Controller is I2C master, I2C0 |
+| SDA | 16 | PB0 | Nodes are I2C slaves, I2C0 |
 | `FU` event | 19 | PB4 | External pull-up; button nodes only |
 | `AT_RS` reset | 18 | RESET | Active-low shared hard reset |
 
 The Pico must release `AT_RS` during normal operation and drive it low only to
-reset all ATtiny nodes. `FU` is a shared active-low, open-drain signal. Start
-and finish nodes assert it when their debounced button is pressed. The Pico
-captures a monotonic microsecond timestamp in the GPIO interrupt handler and
-then queries both button nodes over I2C to identify the source. I2C and web
-processing must not be performed inside the interrupt handler.
+reset all ATtiny nodes. `FU` is a shared active-low, open-drain signal. The
+first active edge of an armed start or finish button produces one non-blocking
+10 ms pulse, independent of how long the button is held or how its contacts
+bounce afterward. The Pico captures a monotonic
+microsecond timestamp on the falling edge and then queries both button nodes
+over I2C to identify the source. I2C and web processing must not be performed
+inside the interrupt handler. The button counters remain authoritative if two
+nodes' pulses overlap.
 
 Laser interruptions are obtained by polling and do not use `FU`. The target
 bus speed is 100 kHz. If the complete physical bus is not reliable at that
@@ -265,16 +270,18 @@ state handling.
 ## I2C Application Protocol
 
 The protocol is binary, versioned, and common to all node roles. Multi-byte
-integers are little-endian. The controller uses command/response transactions;
-nodes never initiate I2C traffic. Protocol constants and packed message layouts
-must live in a shared header used by both firmware targets.
+integers are little-endian. The controller reads and writes a compact register
+map; a command mailbox is reserved for operations with side effects. Nodes
+never initiate I2C traffic. Protocol constants and register layouts must live
+in a shared header used by both firmware targets.
 
-Every response includes enough status to detect a restarted, unconfigured, or
-faulted node. The initial protocol must provide these operations:
+The frequently polled status register includes enough information to detect a
+restarted, unconfigured, or faulted node. The initial protocol provides these
+operations:
 
 | Operation | Required data |
 |---|---|
-| Identify | Protocol version, firmware version, role, address, boot counter |
+| Identify | Protocol version, firmware version, role, address, capabilities |
 | Read status | Input state, status flags, raw ADC, filtered ADC |
 | Read events | Interruption or button-event counter |
 | Configure sensor | Threshold, hysteresis, stable time, cooldown |
@@ -284,10 +291,11 @@ faulted node. The initial protocol must provide these operations:
 | Reset counters | Controller preparation command before every run |
 | Factory reset | Protected setup command, then restart at `0x08` |
 
-Messages must have fixed maximum lengths suitable for the ATtiny85 RAM budget.
-Configuration writes must include validation and a checksum or CRC. Unknown
-commands and invalid values must leave existing configuration unchanged and set
-an error status readable by the controller.
+Registers have fixed lengths suitable for the ATtiny85 RAM budget and important
+blocks include a CRC. Configuration is written to staging registers, validated,
+read back, and explicitly committed. Unknown registers, unknown commands, and
+invalid values must leave active configuration unchanged and set an error
+status readable by the controller.
 
 The controller polls all nodes at least 10 times per second during a run. It
 uses a per-transaction timeout and retries a failed transaction twice. A node
@@ -295,8 +303,9 @@ that remains unavailable, reports a restart, or returns invalid data during a
 run causes the run to abort. Outside a run it moves the controller to `FAULT`
 until a successful rescan and setup check.
 
-The concrete command IDs, byte layouts, maximum node count, and bus timing will
-be defined in `Firmware/protocol.md` before implementation of the bus drivers.
+The concrete register map, command mailbox, byte layouts, limits, retry
+behavior, and initial bus timing are defined in `Firmware/protocol.md`. That
+document is normative for both firmware targets.
 
 ## Controller Responsibilities
 
@@ -604,39 +613,91 @@ depending on an undefined protocol or game rule.
 successfully, and run a basic LED/speaker smoke test. Host tests run through the
 PlatformIO native environment.
 
-### 1. Protocol and ATtiny Platform
+### 1. Protocol, Nodes, and Controller Bus
 
-- Write `protocol.md` with exact messages and shared C definitions.
-- Implement ATtiny timers, ADC, EEPROM configuration, status LED, reset
-  detection, and USI-based I2C slave transport.
-- Verify LED blink patterns on the hardware timer output without timer
-  interrupts.
-- Implement commissioning and EEPROM validation/factory reset.
+Protocol development proceeds as vertical end-to-end slices. A register or
+command is not considered implemented until the shared definition, ATtiny node
+behavior, Pico controller behavior, automated tests where practical, and a
+hardware test all exist. The node and controller bus implementations therefore
+develop together rather than completing one target before starting the other.
 
-**Exit criterion:** one firmware image can commission each node role, retain it
-across power cycles, and reliably answer repeated protocol tests.
+#### 1.1 Shared protocol foundation
 
-### 2. Pico Bus Manager
+- Maintain the normative register map and command mailbox in `protocol.md`.
+- Create a C/C++ compatible shared header containing register addresses, block
+  layouts, roles, flags, commands, results, limits, and compile-time size
+  assertions.
+- Implement the shared CRC-8 routine and host tests, including documented test
+  vectors and corrupt-data cases.
 
-- Implement bus scan, node inventory, protocol/version validation, retries, and
-  fault handling.
-- Test shared reset and `FU` timestamp capture.
-- Measure bus reliability at the intended cable length and node count.
+**Exit criterion:** the same header compiles warning-free for the Pico, ATtiny,
+and native test targets, and all CRC/layout tests pass.
 
-**Exit criterion:** the controller discovers all test nodes, distinguishes the
-two button roles, timestamps their events, and detects disconnects/restarts.
+#### 1.2 First hardware slice: identity
 
-### 3. Laser Detection
+- Implement the minimum ATtiny USI-based I2C target transport at commissioning
+  address `0x08`: register-pointer selection, coherent read snapshots, and the
+  read-only `IDENTITY` register with CRC.
+- Implement the Pico sensor-bus initialization on GPIO 16/17 at 100 kHz,
+  address probing, `IDENTITY` reading, CRC validation, protocol validation, and
+  serial diagnostics.
+- Repeatedly read the real node, then test disconnect and reconnect behavior.
 
-- Implement filtering, hysteresis, stable-time validation, cooldown, and event
-  counters on laser nodes.
-- Build a controller diagnostic view over serial before depending on the web UI.
-- Tune defaults using actual lasers and representative ambient conditions.
+**Exit criterion:** the controller discovers one node at `0x08`, validates its
+identity and CRC over at least 1,000 repeated reads, reports disconnection, and
+communicates again after reconnection without reflashing either target.
 
-**Exit criterion:** deliberate beam breaks count correctly and noise, slow
-threshold crossings, and ponytail-like repeated movement pass recorded tests.
+For this hardware test, flash the node through the Arduino Uno ISP first, then
+disconnect the ISP signal wires before connecting the sensor bus. Uno D11 and
+D13 share the ATtiny PB0/SDA and PB2/SCL pins and must not remain connected
+during I2C operation. Common ground and appropriate board power must remain.
 
-### 4. Game Engine
+#### 1.3 Status, restart detection, and laser events
+
+- Add coherent `FAST_STATUS` and `DIAGNOSTICS` registers to both targets.
+- Implement the ATtiny boot counter, ADC sampling/filtering, hysteresis,
+  stable-time validation, cooldown, event counter, and hardware-timed status
+  LED behavior.
+- Implement controller polling at least ten times per second, modulo-16-bit
+  event differences, restart detection, retries, and serial diagnostics.
+- Tune initial detection values using the real lasers and representative
+  ambient conditions.
+
+**Exit criterion:** deliberate beam breaks count correctly; node restart and
+disconnect are detected; and noise, slow threshold crossings, continuous beam
+breaks, and repeated movement pass recorded hardware tests.
+
+#### 1.4 Configuration and command mailbox
+
+- Add active/staged sensor configuration registers, validation, CRC-protected
+  readback, and the command/result mailboxes on both targets.
+- Implement mode switching, counter reset, EEPROM save/verification, identity
+  commissioning/address change, and factory reset one operation at a time.
+- For every side-effecting command, test lost responses and repeated sequences
+  to verify that retries cannot repeat side effects.
+- Test interrupted/corrupt EEPROM data and recovery to safe defaults.
+
+**Exit criterion:** one firmware image can be commissioned as each role, retain
+valid settings across power cycles, reject invalid writes, reset counters
+reliably, and recover through factory reset.
+
+#### 1.5 Button events and complete bus
+
+- Implement immediate button-edge acceptance, release debounce, the fixed
+  non-blocking `FU` pulse, and start/finish event counters.
+- Implement Pico `FU` timestamp capture, deferred reads of both button counters,
+  overlap detection, periodic counter verification, and event-line faults.
+- Implement complete discovery/inventory validation and shared `AT_RS` reset.
+- Test the full intended inventory on the representative branched 10 m harness;
+  record bus speed, branch lengths, rise times, retries, polling rate, and
+  errors.
+
+**Exit criterion:** the controller discovers and validates all 18 nodes,
+distinguishes and timestamps start/finish events, observes every laser counter
+at the required rate, and detects disconnects, restarts, invalid inventories,
+and `FU` faults.
+
+### 2. Game Engine
 
 - Implement the controller state machine, player queue, timestamp handling,
   between-round counter reset, scoring, aborts, timeouts, and fault transitions.
@@ -646,7 +707,7 @@ threshold crossings, and ponytail-like repeated movement pass recorded tests.
 **Exit criterion:** complete games run through serial/local controls with
 deterministic scores and correct behavior for invalid and fault events.
 
-### 5. Persistence
+### 3. Persistence
 
 - Implement versioned, atomic controller storage and migration/default handling.
 - Store settings, node inventory/configuration, recent attempts, and top scores.
@@ -656,7 +717,7 @@ deterministic scores and correct behavior for invalid and fault events.
 **Exit criterion:** completed data survives reboot and simulated incomplete or
 corrupt writes recover without preventing setup.
 
-### 6. Web Interface
+### 4. Web Interface
 
 - Implement AP configuration, editable persisted credentials, HTTP API, SSE
   state stream, setup view, and game view.
@@ -667,7 +728,7 @@ corrupt writes recover without preventing setup.
 **Exit criterion:** one PC can configure the system and operate a full game,
 including queuing the next player, without serial access.
 
-### 7. Local UI and Integration
+### 5. Local UI and Integration
 
 - Complete LCD/encoder navigation, including SSID, password, and IP display,
   and document all LED and sound patterns.
@@ -680,7 +741,7 @@ including queuing the next player, without serial access.
 **Exit criterion:** the assembled game meets all requirements in this document
 for repeated multi-player sessions.
 
-### 8. Release and Maintenance
+### 6. Release and Maintenance
 
 - Document flashing, commissioning, setup, backup/reset, and troubleshooting.
 - Record firmware versions and build artifacts.
