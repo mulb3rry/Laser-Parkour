@@ -17,9 +17,11 @@ enum usi_state {
 static volatile enum usi_state state;
 static uint8_t target_address;
 static uint8_t selected_register;
-static const uint8_t *identity_data;
-static uint8_t identity_size;
+static const usi_i2c_register_t *register_table;
+static uint8_t register_table_size;
 static uint8_t transmit_index;
+static uint8_t transmit_size;
+static uint8_t transmit_buffer[LP_IDENTITY_REGISTER_SIZE];
 
 static void sda_release(void) {
   DDRB &= (uint8_t)~_BV(PB0);
@@ -61,13 +63,30 @@ static void receive_master_ack(void) {
 }
 
 static uint8_t next_transmit_byte(void) {
-  if (selected_register == LP_REGISTER_IDENTITY &&
-      transmit_index < identity_size) {
-    return identity_data[transmit_index++];
+  if (transmit_index < transmit_size) {
+    return transmit_buffer[transmit_index++];
   }
 
   ++transmit_index;
   return 0xFFU;
+}
+
+static void snapshot_selected_register(void) {
+  transmit_size = 0U;
+  for (uint8_t index = 0U; index < register_table_size; ++index) {
+    if (register_table[index].address != selected_register) {
+      continue;
+    }
+
+    transmit_size = register_table[index].size;
+    if (transmit_size > sizeof(transmit_buffer)) {
+      transmit_size = sizeof(transmit_buffer);
+    }
+    for (uint8_t byte = 0U; byte < transmit_size; ++byte) {
+      transmit_buffer[byte] = register_table[index].data[byte];
+    }
+    break;
+  }
 }
 
 static void send_next_byte(void) {
@@ -76,12 +95,11 @@ static void send_next_byte(void) {
   clear_usi_counter(0U);
 }
 
-void usi_i2c_target_init(uint8_t address, const uint8_t *identity,
-                         size_t identity_length) {
+void usi_i2c_target_init(uint8_t address, const usi_i2c_register_t *registers,
+                         uint8_t register_count) {
   target_address = address;
-  identity_data = identity;
-  identity_size = identity_length > UINT8_MAX ? UINT8_MAX
-                                               : (uint8_t)identity_length;
+  register_table = registers;
+  register_table_size = register_count;
   selected_register = LP_REGISTER_IDENTITY;
   transmit_index = 0U;
   state = USI_STATE_ADDRESS;
@@ -124,6 +142,7 @@ ISR(USI_OVF_vect) {
 
       if ((address_and_direction & 0x01U) != 0U) {
         transmit_index = 0U;
+        snapshot_selected_register();
         state = USI_STATE_TRANSMIT_BYTE_AFTER_ADDRESS_ACK;
         send_ack();
       } else {

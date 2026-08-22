@@ -4,7 +4,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
-void usi_i2c_target_init(uint8_t address, const uint8_t *identity,
-                         size_t identity_length);
+typedef struct {
+  uint8_t address;
+  const uint8_t *data;
+  uint8_t size;
+} usi_i2c_register_t;
+
+void usi_i2c_target_init(uint8_t address, const usi_i2c_register_t *registers,
+                         uint8_t register_count);
 
 #endif

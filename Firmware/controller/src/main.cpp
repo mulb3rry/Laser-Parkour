@@ -16,6 +16,10 @@ uint32_t successfulReads = 0;
 uint32_t failedReads = 0;
 uint32_t lastPollMs = 0;
 bool nodeWasAvailable = false;
+bool statusBaselineValid = false;
+bool statusWasAvailable = false;
+uint16_t lastBootCounter = 0U;
+uint16_t lastEventCounter = 0U;
 
 enum class IdentityReadResult : uint8_t {
   OK,
@@ -65,9 +69,10 @@ const char *roleName(uint8_t role) {
   }
 }
 
-bool readIdentity(lp_identity_register_t &identity) {
+bool readRegisterBlock(uint8_t registerAddress, uint8_t *bytes,
+                       size_t expected) {
   Wire.beginTransmission(LP_ADDRESS_COMMISSIONING);
-  Wire.write(static_cast<uint8_t>(LP_REGISTER_IDENTITY));
+  Wire.write(registerAddress);
   // Use a STOP between pointer selection and reading while validating the
   // initial USI implementation. Repeated-START support is tested separately
   // once the basic register transaction is reliable.
@@ -82,7 +87,6 @@ bool readIdentity(lp_identity_register_t &identity) {
     return false;
   }
 
-  const size_t expected = sizeof(identity);
   const size_t received = Wire.requestFrom(
       static_cast<uint8_t>(LP_ADDRESS_COMMISSIONING), expected, true);
   if (received != expected) {
@@ -93,7 +97,6 @@ bool readIdentity(lp_identity_register_t &identity) {
     return false;
   }
 
-  uint8_t *bytes = reinterpret_cast<uint8_t *>(&identity);
   for (size_t index = 0U; index < expected; ++index) {
     if (Wire.available() == 0) {
       lastReadResult = IdentityReadResult::SHORT_READ;
@@ -103,9 +106,20 @@ bool readIdentity(lp_identity_register_t &identity) {
   }
 
   const uint8_t expectedCrc = lp_register_crc8(
-      LP_REGISTER_IDENTITY, bytes, expected - sizeof(identity.crc8));
-  if (identity.crc8 != expectedCrc) {
+      registerAddress, bytes, expected - 1U);
+  if (bytes[expected - 1U] != expectedCrc) {
     lastReadResult = IdentityReadResult::CRC_ERROR;
+    return false;
+  }
+
+  lastReadResult = IdentityReadResult::OK;
+  return true;
+}
+
+bool readIdentity(lp_identity_register_t &identity) {
+  if (!readRegisterBlock(LP_REGISTER_IDENTITY,
+                         reinterpret_cast<uint8_t *>(&identity),
+                         sizeof(identity))) {
     return false;
   }
   if (identity.protocol_major != LP_PROTOCOL_MAJOR ||
@@ -118,6 +132,97 @@ bool readIdentity(lp_identity_register_t &identity) {
 
   lastReadResult = IdentityReadResult::OK;
   return true;
+}
+
+bool readFastStatus(lp_fast_status_register_t &status) {
+  return readRegisterBlock(LP_REGISTER_FAST_STATUS,
+                           reinterpret_cast<uint8_t *>(&status),
+                           sizeof(status));
+}
+
+bool readNodeDiagnostics(lp_diagnostics_register_t &diagnostics) {
+  return readRegisterBlock(LP_REGISTER_DIAGNOSTICS,
+                           reinterpret_cast<uint8_t *>(&diagnostics),
+                           sizeof(diagnostics));
+}
+
+void printFastStatus(const lp_fast_status_register_t &status) {
+  Serial.print("Node status: boot=");
+  Serial.print(lp_u16_decode(status.boot_counter));
+  Serial.print(", events=");
+  Serial.print(lp_u16_decode(status.event_counter));
+  Serial.print(", flags=0x");
+  Serial.println(lp_u16_decode(status.status_flags), HEX);
+}
+
+void printNodeDiagnostics(const lp_diagnostics_register_t &diagnostics) {
+  Serial.print("Node diagnostics: raw=");
+  Serial.print(lp_u16_decode(diagnostics.raw_adc));
+  Serial.print(", filtered=");
+  Serial.print(lp_u16_decode(diagnostics.filtered_adc));
+  Serial.print(", input=");
+  Serial.print(diagnostics.input_state);
+  Serial.print(", cooldown=");
+  Serial.print(lp_u16_decode(diagnostics.cooldown_remaining_ms));
+  Serial.println(" ms");
+}
+
+bool readWithRetries(lp_fast_status_register_t &status) {
+  for (uint8_t attempt = 0U; attempt < 3U; ++attempt) {
+    if (readFastStatus(status)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void pollFastStatus(void) {
+  lp_fast_status_register_t status{};
+  if (!readWithRetries(status)) {
+    if (statusWasAvailable) {
+      Serial.print("Node status unavailable after retries: ");
+      Serial.println(readResultName(lastReadResult));
+    }
+    statusWasAvailable = false;
+    return;
+  }
+
+  const uint16_t bootCounter = lp_u16_decode(status.boot_counter);
+  const uint16_t eventCounter = lp_u16_decode(status.event_counter);
+  statusWasAvailable = true;
+  if (!statusBaselineValid) {
+    lastBootCounter = bootCounter;
+    lastEventCounter = eventCounter;
+    statusBaselineValid = true;
+    printFastStatus(status);
+    return;
+  }
+
+  if (bootCounter != lastBootCounter) {
+    Serial.print("NODE RESTART detected: boot counter ");
+    Serial.print(lastBootCounter);
+    Serial.print(" -> ");
+    Serial.println(bootCounter);
+    lastBootCounter = bootCounter;
+    lastEventCounter = eventCounter;
+    return;
+  }
+
+  const uint16_t eventDifference =
+      static_cast<uint16_t>(eventCounter - lastEventCounter);
+  if (eventDifference != 0U) {
+    Serial.print("Laser events: +");
+    Serial.print(eventDifference);
+    Serial.print(" (total ");
+    Serial.print(eventCounter);
+    Serial.println(')');
+    lastEventCounter = eventCounter;
+
+    lp_diagnostics_register_t diagnostics{};
+    if (readNodeDiagnostics(diagnostics)) {
+      printNodeDiagnostics(diagnostics);
+    }
+  }
 }
 
 void printIdentity(const lp_identity_register_t &identity) {
@@ -190,6 +295,14 @@ void printDiagnostics(void) {
     nodeWasAvailable = true;
     Serial.println("Node 0x08 connected and validated");
     printIdentity(identity);
+    lp_fast_status_register_t status{};
+    if (readWithRetries(status)) {
+      printFastStatus(status);
+    }
+    lp_diagnostics_register_t diagnostics{};
+    if (readNodeDiagnostics(diagnostics)) {
+      printNodeDiagnostics(diagnostics);
+    }
   } else {
     nodeWasAvailable = false;
     Serial.print("Node 0x08 unavailable or identity invalid: ");
@@ -242,5 +355,6 @@ void loop() {
   if (millis() - lastPollMs >= POLL_INTERVAL_MS) {
     lastPollMs = millis();
     pollIdentity();
+    pollFastStatus();
   }
 }

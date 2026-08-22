@@ -120,7 +120,7 @@ All other role values are invalid in protocol version 1.
 | Value | Name | Meaning |
 |---:|---|---|
 | 0 | `SETUP` | Configuration, diagnostics, and visible node status |
-| 1 | `GAME` | Event detection active; laser-node status LED off |
+| 1 | `GAME` | Event detection active; all node LED indications forced off |
 
 Nodes always boot into `SETUP`. Operating mode is not persisted.
 
@@ -352,6 +352,7 @@ the explicitly deferred address-change and factory-reset behavior below.
 | `0x02` | `SAVE_CONFIG` | All zero | Low byte address, high byte saved-record CRC |
 | `0x03` | `RESET_COUNTER` | `arg0..1=preparation token`; others zero | Resulting counter (`0`) |
 | `0x04` | `FACTORY_RESET` | ASCII `L`, `P`, `F`, `R` | Resulting address (`0x08`) |
+| `0x05` | `IDENTIFY` | All zero | Identify duration in seconds (`10`) |
 
 #### `SET_MODE`
 
@@ -393,6 +394,14 @@ The node prepares a successful result before clearing EEPROM. It erases its
 identity/configuration and restarts at `0x08` only after the controller has
 completely read the matching result. The controller waits at least 20 ms before
 probing `0x08`.
+
+#### `IDENTIFY`
+
+Valid only in `SETUP`. The node drives its status LED with the fast Identify
+pattern for ten seconds, temporarily overriding its other LED state. The
+command does not change configuration or event detection. Retrying the same
+command and sequence returns the cached result without restarting the timer; a
+new command sequence starts a new ten-second interval.
 
 ## 8. Transactions, retries, and timing
 
