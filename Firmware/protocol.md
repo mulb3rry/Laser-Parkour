@@ -120,7 +120,7 @@ All other role values are invalid in protocol version 1.
 | Value | Name | Meaning |
 |---:|---|---|
 | 0 | `SETUP` | Configuration, diagnostics, and visible node status |
-| 1 | `GAME` | Event detection active; all node LED indications forced off |
+| 1 | `GAME` | Event detection active; normal node LED indications remain active |
 
 Nodes always boot into `SETUP`. Operating mode is not persisted.
 
@@ -272,8 +272,9 @@ writable. Their data layouts are identical:
 | 6 | 2 | Cooldown | milliseconds |
 | 8 | 1 | CRC | — |
 
-They are valid only for laser nodes, except that an uncommissioned node may
-stage sensor configuration before saving a staged `LASER` identity.
+Writes are accepted only in `SETUP`. The blocks are valid only for laser nodes,
+except that an uncommissioned node may stage sensor configuration before
+saving a staged `LASER` identity.
 
 Validation ranges are:
 
@@ -352,13 +353,13 @@ the explicitly deferred address-change and factory-reset behavior below.
 | `0x02` | `SAVE_CONFIG` | All zero | Low byte address, high byte saved-record CRC |
 | `0x03` | `RESET_COUNTER` | `arg0..1=preparation token`; others zero | Resulting counter (`0`) |
 | `0x04` | `FACTORY_RESET` | ASCII `L`, `P`, `F`, `R` | Resulting address (`0x08`) |
-| `0x05` | `IDENTIFY` | All zero | Identify duration in seconds (`10`) |
+| `0x05` | `IDENTIFY` | All zero | Identify duration in seconds (`4`) |
 
 #### `SET_MODE`
 
 Changes volatile mode only. Entering `GAME` is rejected unless configuration
-is valid and the node is commissioned. A laser-node status LED is disabled in
-`GAME`. Event detection and counters continue in both modes.
+is valid and the node is commissioned. Node LED state indications, event
+detection, and counters continue in both modes.
 
 #### `SAVE_CONFIG`
 
@@ -398,10 +399,10 @@ probing `0x08`.
 #### `IDENTIFY`
 
 Valid only in `SETUP`. The node drives its status LED with the fast Identify
-pattern for ten seconds, temporarily overriding its other LED state. The
+pattern for four seconds, temporarily overriding its other LED state. The
 command does not change configuration or event detection. Retrying the same
 command and sequence returns the cached result without restarting the timer; a
-new command sequence starts a new ten-second interval.
+new command sequence starts a new four-second interval.
 
 ## 8. Transactions, retries, and timing
 

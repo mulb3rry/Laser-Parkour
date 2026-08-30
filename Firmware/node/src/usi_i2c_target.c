@@ -2,6 +2,7 @@
 
 #include <avr/interrupt.h>
 #include <avr/io.h>
+#include <util/atomic.h>
 
 #include "laser_protocol.h"
 
@@ -22,6 +23,16 @@ static uint8_t register_table_size;
 static uint8_t transmit_index;
 static uint8_t transmit_size;
 static uint8_t transmit_buffer[LP_IDENTITY_REGISTER_SIZE];
+static uint8_t receive_index;
+static uint8_t receive_size;
+static uint8_t receive_register;
+static uint8_t receive_buffer[LP_SENSOR_CONFIG_REGISTER_SIZE];
+static volatile uint8_t receive_pending;
+static uint8_t pointer_received;
+static volatile uint8_t completed_read_pending;
+static uint8_t completed_read_register;
+static uint8_t completed_read_size;
+static uint8_t completed_read_buffer[LP_COMMAND_RESULT_REGISTER_SIZE];
 
 static void sda_release(void) {
   DDRB &= (uint8_t)~_BV(PB0);
@@ -89,6 +100,15 @@ static void snapshot_selected_register(void) {
   }
 }
 
+static uint8_t selected_register_write_size(void) {
+  for (uint8_t index = 0U; index < register_table_size; ++index) {
+    if (register_table[index].address == selected_register) {
+      return register_table[index].write_size;
+    }
+  }
+  return 0U;
+}
+
 static void send_next_byte(void) {
   USIDR = next_transmit_byte();
   sda_drive();
@@ -102,6 +122,9 @@ void usi_i2c_target_init(uint8_t address, const usi_i2c_register_t *registers,
   register_table_size = register_count;
   selected_register = LP_REGISTER_IDENTITY;
   transmit_index = 0U;
+  receive_pending = 0U;
+  completed_read_pending = 0U;
+  pointer_received = 0U;
   state = USI_STATE_ADDRESS;
 
   // In USI two-wire mode SDA is released through its DDR bit, while SCL must
@@ -114,6 +137,42 @@ void usi_i2c_target_init(uint8_t address, const usi_i2c_register_t *registers,
   DDRB |= _BV(PB2);
   USIDR = 0xFFU;
   enter_start_condition_mode();
+}
+
+uint8_t usi_i2c_target_take_completed_read(uint8_t *register_address,
+                                           uint8_t *data, uint8_t capacity) {
+  uint8_t length = 0U;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    if (completed_read_pending != 0U && completed_read_size <= capacity) {
+      *register_address = completed_read_register;
+      length = completed_read_size;
+      for (uint8_t index = 0U; index < length; ++index) {
+        data[index] = completed_read_buffer[index];
+      }
+      completed_read_pending = 0U;
+    }
+  }
+  return length;
+}
+
+void usi_i2c_target_set_address(uint8_t address) {
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { target_address = address; }
+}
+
+uint8_t usi_i2c_target_take_write(uint8_t *register_address, uint8_t *data,
+                                  uint8_t capacity) {
+  uint8_t length = 0U;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    if (receive_pending != 0U && receive_size <= capacity) {
+      *register_address = receive_register;
+      length = receive_size;
+      for (uint8_t index = 0U; index < length; ++index) {
+        data[index] = receive_buffer[index];
+      }
+      receive_pending = 0U;
+    }
+  }
+  return length;
 }
 
 ISR(USI_START_vect) {
@@ -146,6 +205,9 @@ ISR(USI_OVF_vect) {
         state = USI_STATE_TRANSMIT_BYTE_AFTER_ADDRESS_ACK;
         send_ack();
       } else {
+        receive_index = 0U;
+        receive_size = 0U;
+        pointer_received = 0U;
         state = USI_STATE_RECEIVE_BYTE_ACKNOWLEDGED;
         send_ack();
       }
@@ -153,7 +215,18 @@ ISR(USI_OVF_vect) {
     }
 
     case USI_STATE_RECEIVE_BYTE:
-      selected_register = USIDR;
+      if (pointer_received == 0U) {
+        selected_register = USIDR;
+        receive_register = selected_register;
+        pointer_received = 1U;
+        receive_size = selected_register_write_size();
+      } else if (receive_index < receive_size &&
+                 receive_index < sizeof(receive_buffer)) {
+        receive_buffer[receive_index++] = USIDR;
+        if (receive_index == receive_size) {
+          receive_pending = 1U;
+        }
+      }
       state = USI_STATE_RECEIVE_BYTE_ACKNOWLEDGED;
       send_ack();
       break;
@@ -178,6 +251,17 @@ ISR(USI_OVF_vect) {
         state = USI_STATE_REQUEST_MASTER_ACK;
         send_next_byte();
       } else {
+        if (transmit_index >= transmit_size) {
+          completed_read_register = selected_register;
+          completed_read_size = transmit_size;
+          if (completed_read_size > sizeof(completed_read_buffer)) {
+            completed_read_size = sizeof(completed_read_buffer);
+          }
+          for (uint8_t index = 0U; index < completed_read_size; ++index) {
+            completed_read_buffer[index] = transmit_buffer[index];
+          }
+          completed_read_pending = 1U;
+        }
         enter_start_condition_mode();
       }
       break;
