@@ -14,6 +14,8 @@
 enum {
   ADC_SAMPLE_TICKS = 156U,
   SAMPLE_PERIOD_MS = 10U,
+  BUTTON_RELEASE_SAMPLES = 5U,
+  BUTTON_LONG_PRESS_SAMPLES = 300U,
 };
 
 static uint16_t EEMEM persisted_boot_counter;
@@ -71,6 +73,11 @@ static uint16_t event_counter;
 static uint8_t counter_overflowed;
 static uint8_t operating_mode = LP_MODE_SETUP;
 static uint16_t identify_samples_remaining;
+static uint8_t button_armed;
+static uint8_t button_release_samples;
+static uint16_t button_pressed_samples;
+static uint8_t fu_pulse_active;
+static uint8_t fu_pulse_started_tick;
 
 typedef enum {
   LED_STATE_UNINITIALIZED,
@@ -82,6 +89,9 @@ typedef enum {
 } led_state_t;
 
 static led_state_t led_state = LED_STATE_UNINITIALIZED;
+
+static uint8_t role_is_button(void);
+static uint8_t button_is_pressed(void);
 
 static const usi_i2c_register_t register_table[] = {
     {LP_REGISTER_IDENTITY, (const uint8_t *)&identity, sizeof(identity), 0U},
@@ -158,6 +168,10 @@ static void update_status_led(uint8_t beam_broken) {
     status_led_set(LED_STATE_FAST);
   } else if (node_error != 0U || identity.role == LP_ROLE_UNCONFIGURED) {
     status_led_set(LED_STATE_NORMAL);
+  } else if (role_is_button() && button_is_pressed()) {
+    status_led_set(button_pressed_samples >= BUTTON_LONG_PRESS_SAMPLES
+                       ? LED_STATE_SLOW
+                       : LED_STATE_OFF);
   } else if (beam_broken && identity.role == LP_ROLE_LASER) {
     status_led_set(LED_STATE_SLOW);
   } else {
@@ -187,6 +201,58 @@ static uint16_t increment_boot_counter(void) {
   const uint16_t current = (uint16_t)(previous + 1U);
   eeprom_update_word(&persisted_boot_counter, current);
   return current;
+}
+
+static uint8_t role_is_button(void) {
+  return identity.role == LP_ROLE_START || identity.role == LP_ROLE_FINISH;
+}
+
+static uint8_t button_is_pressed(void) {
+  return (PINB & _BV(PB3)) == 0U;
+}
+
+static void role_io_init(void) {
+  // FU is open drain: PORT remains low, DDR output asserts and DDR input
+  // releases the externally pulled-up shared line.
+  PORTB &= (uint8_t)~_BV(PB4);
+  DDRB &= (uint8_t)~_BV(PB4);
+
+  if (role_is_button()) {
+    ADCSRA = 0U;
+    DIDR0 &= (uint8_t)~_BV(ADC3D);
+    DDRB &= (uint8_t)~_BV(PB3);
+    PORTB |= _BV(PB3);
+    button_armed = button_is_pressed() ? 0U : 1U;
+    button_pressed_samples = 0U;
+  } else {
+    adc_init();
+  }
+}
+
+static void update_fu_pulse(void) {
+  if (fu_pulse_active != 0U &&
+      (uint8_t)(TCNT0 - fu_pulse_started_tick) >= ADC_SAMPLE_TICKS) {
+    DDRB &= (uint8_t)~_BV(PB4);
+    fu_pulse_active = 0U;
+  }
+}
+
+static void process_button_edge(void) {
+  if (!role_is_button()) {
+    return;
+  }
+  if (button_armed != 0U && button_is_pressed()) {
+    ++event_counter;
+    if (event_counter == 0U) {
+      counter_overflowed = 1U;
+    }
+    button_armed = 0U;
+    button_release_samples = 0U;
+    button_pressed_samples = 0U;
+    fu_pulse_started_tick = TCNT0;
+    fu_pulse_active = 1U;
+    DDRB |= _BV(PB4);
+  }
 }
 
 static uint8_t sensor_config_is_valid(
@@ -443,6 +509,7 @@ static void activate_pending_config(void) {
   config_valid = 1U;
   pending_config_activation = 0U;
   usi_i2c_target_set_address(identity.address);
+  role_io_init();
 }
 
 static void process_pending_write(void) {
@@ -555,11 +622,6 @@ int main(void) {
   MCUSR = 0U;
   wdt_disable();
 
-  status_led_init();
-  adc_init();
-  TCCR0A = 0U;
-  TCCR0B = _BV(CS01) | _BV(CS00);  // /64: 64 us per Timer0 tick.
-
   persisted_config_t loaded_config;
   eeprom_read_block(&loaded_config, &persisted_config, sizeof(loaded_config));
   if (persisted_config_is_valid(&loaded_config)) {
@@ -568,12 +630,20 @@ int main(void) {
     activate_pending_config();
   }
 
+  status_led_init();
+  TCCR0A = 0U;
+  TCCR0B = _BV(CS01) | _BV(CS00);  // /64: 64 us per Timer0 tick.
+  role_io_init();
+
   const uint16_t boot_counter = increment_boot_counter();
   event_counter = 0U;
-  uint16_t raw_adc = adc_read();
+  uint16_t raw_adc = role_is_button() ? 0U : adc_read();
   uint16_t filtered_adc = raw_adc;
-  uint8_t beam_broken =
-      filtered_adc >= lp_u16_decode(active_sensor_config.broken_threshold);
+  uint8_t beam_broken = role_is_button()
+                            ? 0U
+                            : filtered_adc >= lp_u16_decode(
+                                                  active_sensor_config
+                                                      .broken_threshold);
   uint8_t pending_state = beam_broken;
   uint8_t pending_samples = 0U;
   uint16_t cooldown_samples = 0U;
@@ -606,6 +676,9 @@ int main(void) {
   uint8_t last_sample_tick = TCNT0;
   for (;;) {
     process_pending_write();
+    update_fu_pulse();
+    process_button_edge();
+    update_status_led(beam_broken);
     uint8_t completed_register = 0U;
     uint8_t completed_data[LP_COMMAND_RESULT_REGISTER_SIZE];
     const uint8_t completed_length = usi_i2c_target_take_completed_read(
@@ -637,15 +710,35 @@ int main(void) {
     }
     last_sample_tick = (uint8_t)(last_sample_tick + ADC_SAMPLE_TICKS);
 
-    if (cooldown_samples > 0U) {
+    if (cooldown_samples > 0U && !role_is_button()) {
       --cooldown_samples;
     }
     if (identify_samples_remaining > 0U) {
       --identify_samples_remaining;
     }
 
-    raw_adc = adc_read();
-    filtered_adc = (uint16_t)((filtered_adc * 15UL + raw_adc) / 16UL);
+    if (role_is_button()) {
+      raw_adc = 0U;
+      filtered_adc = 0U;
+      cooldown_samples = 0U;
+      if (!button_is_pressed()) {
+        button_pressed_samples = 0U;
+        if (button_release_samples < BUTTON_RELEASE_SAMPLES) {
+          ++button_release_samples;
+        }
+        if (button_release_samples >= BUTTON_RELEASE_SAMPLES) {
+          button_armed = 1U;
+        }
+      } else {
+        button_release_samples = 0U;
+        if (button_pressed_samples < BUTTON_LONG_PRESS_SAMPLES) {
+          ++button_pressed_samples;
+        }
+      }
+    } else {
+      raw_adc = adc_read();
+      filtered_adc = (uint16_t)((filtered_adc * 15UL + raw_adc) / 16UL);
+    }
 
     const uint16_t broken_threshold =
         lp_u16_decode(active_sensor_config.broken_threshold);
@@ -660,15 +753,20 @@ int main(void) {
     }
 
     uint8_t candidate = beam_broken;
-    if (!beam_broken && filtered_adc >= broken_threshold) {
+    if (!role_is_button() && !beam_broken &&
+        filtered_adc >= broken_threshold) {
       candidate = 1U;
-    } else if (beam_broken && filtered_adc <= clear_threshold) {
+    } else if (!role_is_button() && beam_broken &&
+               filtered_adc <= clear_threshold) {
       candidate = 0U;
     }
 
-    uint8_t input_state =
-        beam_broken ? LP_INPUT_ACTIVE : LP_INPUT_INACTIVE;
-    if (candidate != beam_broken) {
+    uint8_t input_state = role_is_button()
+                              ? (button_is_pressed() ? LP_INPUT_ACTIVE
+                                                     : LP_INPUT_INACTIVE)
+                              : (beam_broken ? LP_INPUT_ACTIVE
+                                             : LP_INPUT_INACTIVE);
+    if (!role_is_button() && candidate != beam_broken) {
       if (candidate != pending_state) {
         pending_state = candidate;
         pending_samples = 1U;
@@ -693,7 +791,7 @@ int main(void) {
               SAMPLE_PERIOD_MS;
         }
       }
-    } else {
+    } else if (!role_is_button()) {
       pending_state = beam_broken;
       pending_samples = 0U;
     }
@@ -705,7 +803,8 @@ int main(void) {
     if (operating_mode == LP_MODE_GAME) {
       status_flags |= LP_STATUS_GAME_MODE;
     }
-    if (beam_broken) {
+    if ((role_is_button() && button_is_pressed()) ||
+        (!role_is_button() && beam_broken)) {
       status_flags |= LP_STATUS_INPUT_ACTIVE;
     }
     if (input_state == LP_INPUT_UNSTABLE) {
@@ -726,8 +825,6 @@ int main(void) {
     if (last_result != LP_RESULT_OK) {
       status_flags |= LP_STATUS_LAST_OPERATION_ERROR;
     }
-
-    update_status_led(beam_broken);
 
     publish_registers(boot_counter, event_counter, status_flags, raw_adc,
                       filtered_adc, input_state, cooldown_samples);

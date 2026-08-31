@@ -22,6 +22,11 @@ uint16_t lastBootCounter = 0U;
 uint16_t lastEventCounter = 0U;
 uint8_t nodeAddress = LP_ADDRESS_COMMISSIONING;
 uint8_t commandSequence = 0U;
+volatile bool fuEdgePending = false;
+volatile uint32_t fuEdgeTimestampUs = 0U;
+volatile uint32_t fuEdgeCount = 0U;
+volatile bool fuRisePending = false;
+volatile uint32_t fuPulseWidthUs = 0U;
 
 enum class IdentityReadResult : uint8_t {
   OK,
@@ -54,6 +59,18 @@ const char *readResultName(IdentityReadResult result) {
       return "invalid identity content";
   }
   return "unknown";
+}
+
+void onFuEdge(void) {
+  const uint32_t now = micros();
+  if (digitalRead(PIN_EVENT) == LOW) {
+    fuEdgeTimestampUs = now;
+    ++fuEdgeCount;
+    fuEdgePending = true;
+  } else {
+    fuPulseWidthUs = now - fuEdgeTimestampUs;
+    fuRisePending = true;
+  }
 }
 
 const char *roleName(uint8_t role) {
@@ -512,7 +529,7 @@ void pollFastStatus(void) {
   const uint16_t eventDifference =
       static_cast<uint16_t>(eventCounter - lastEventCounter);
   if (eventDifference != 0U) {
-    Serial.print("Laser events: +");
+    Serial.print("Node events: +");
     Serial.print(eventDifference);
     Serial.print(" (total ");
     Serial.print(eventCounter);
@@ -523,6 +540,37 @@ void pollFastStatus(void) {
     if (readNodeDiagnostics(diagnostics)) {
       printNodeDiagnostics(diagnostics);
     }
+  }
+}
+
+void handleFuEdge(void) {
+  if (!fuEdgePending && !fuRisePending) {
+    return;
+  }
+  noInterrupts();
+  const uint32_t timestampUs = fuEdgeTimestampUs;
+  const uint32_t edgeCount = fuEdgeCount;
+  const bool falling = fuEdgePending;
+  const bool rising = fuRisePending;
+  const uint32_t pulseWidthUs = fuPulseWidthUs;
+  fuEdgePending = false;
+  fuRisePending = false;
+  interrupts();
+
+  if (falling) {
+    Serial.print("FU falling edge #");
+    Serial.print(edgeCount);
+    Serial.print(" at ");
+    Serial.print(timestampUs);
+    Serial.println(" us");
+    // This single-node test immediately correlates the edge with the selected
+    // node. Full inventory handling will read both button counters.
+    pollFastStatus();
+  }
+  if (rising) {
+    Serial.print("FU low pulse: ");
+    Serial.print(pulseWidthUs);
+    Serial.println(" us");
   }
 }
 
@@ -657,6 +705,7 @@ void handleSerialInput(void) {
 void setup() {
   pinMode(PIN_NODE_RESET, INPUT);
   pinMode(PIN_EVENT, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_EVENT), onFuEdge, CHANGE);
 
   Serial.begin(115200);
   delay(1000);
@@ -695,6 +744,7 @@ void setup() {
 
 void loop() {
   handleSerialInput();
+  handleFuEdge();
   if (millis() - lastPollMs >= POLL_INTERVAL_MS) {
     lastPollMs = millis();
     pollIdentity();

@@ -254,7 +254,7 @@ The node uses these indications, in descending priority:
 | 1 | Fast blink | Approximately 4 Hz | An operator requested `IDENTIFY` |
 | 2 | Normal blink | Approximately 2 Hz | The node has detected an error |
 | 3 | Normal blink | Approximately 2 Hz | The node is uncommissioned |
-| 4 | Slow blink | Approximately 1 Hz | A commissioned laser node detects a broken beam in setup mode |
+| 4 | Slow blink | Approximately 1 Hz | A laser beam is broken, or a button remains pressed for at least three seconds |
 | 5 | Steady on | — | Normal commissioned operation in setup mode |
 
 `IDENTIFY` lasts four seconds and temporarily overrides every other indication.
@@ -264,6 +264,12 @@ cause is available through the controller and web UI. Commissioned nodes use
 the same normal and broken-beam indications in `SETUP` and `GAME`: steady on
 when healthy and clear, and slow blinking for a broken laser. Identify remains
 available only in setup mode.
+
+A commissioned start/finish node is steadily on while its button is released.
+Pressing the button turns the LED off immediately. Releasing it turns the LED
+back on. If it remains pressed for three seconds, the node changes from off to
+the slow 1 Hz hardware blink and continues blinking until release. This visual
+behavior does not delay the accepted edge, extend `FU`, or change debounce.
 
 The error blink represents a node/system fault, such as an EEPROM verification
 failure. A correctly rejected controller request remains visible through
