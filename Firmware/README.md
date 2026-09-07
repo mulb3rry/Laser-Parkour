@@ -153,31 +153,36 @@ I2C address are configuration data rather than compile-time options.
 | SCL | 17 | PB2 | Controller is I2C master, I2C0 |
 | SDA | 16 | PB0 | Nodes are I2C slaves, I2C0 |
 | `FU` event | 19 | PB4 | External pull-up; button nodes only |
-| `AT_RS` reset | 18 | RESET | Active-low shared hard reset |
+| Unused reset net | 18 | RESET | Not available; node PCB reset jumpers are not fitted |
 
-The Pico must release `AT_RS` during normal operation and drive it low only to
-reset all ATtiny nodes. `FU` is a shared active-low, open-drain signal. The
-first active edge of an armed start or finish button produces one non-blocking
-10 ms pulse, independent of how long the button is held or how its contacts
-bounce afterward. The Pico captures a monotonic
+GPIO18 must not be used to reset the nodes: the `AT_RS` net exists in the PCB
+design, but the reset jumpers on the assembled node boards are open and will
+remain unsoldered. Node event counters are reset through the protocol command;
+recovering an unresponsive node requires cycling system power or servicing that
+node. `FU` is a shared active-low, open-drain signal. The first active edge of
+an armed start or finish button produces one non-blocking 10 ms pulse,
+independent of how long the button is held or how its contacts bounce afterward.
+The Pico captures a monotonic
 microsecond timestamp on the falling edge and then queries both button nodes
 over I2C to identify the source. I2C and web processing must not be performed
 inside the interrupt handler. The button counters remain authoritative if two
 nodes' pulses overlap.
 
-Laser interruptions are obtained by polling and do not use `FU`. The target
-bus speed is 100 kHz. If the complete physical bus is not reliable at that
-speed, it may be reduced after measurement; the selected speed must be tested
-with the maximum intended cable length and node count.
+Laser interruptions are obtained by polling and do not use `FU`. The sensor
+bus speed is 10 kHz, reduced from the initial 100 kHz after communication
+failures appeared on the assembled branched wiring. The selected speed must be
+tested with a branch topology representative of the actual installation and
+the intended node count.
 
-The supported installation contains up to 16 laser nodes plus one start and one
-finish node, for 18 nodes total. The complete sensor-bus cable length is about
-10 m. A strictly linear topology is not required; branches are part of the
-intended installation. Bus qualification must therefore use a representative
-branched 10 m harness with all 18 nodes, not only a short bench bus. The tested
-branch lengths, bus speed, rise times, and error results must be recorded.
-Discovery of more than 16 laser nodes is a configuration fault and prevents the
-game from being armed.
+The controller accepts up to 16 laser nodes plus one start and one finish node,
+for 18 nodes total. Normal installations are expected to contain about 8–12
+nodes total. Larger inventories remain valid, but their complete polling cycle
+is slower at 10 kHz. Branches are part of the intended installation; there is
+no single nominal total cable length. Bus qualification must use a topology
+representative of the actual installation and record the node count, branch
+layout, bus speed, polling time, rise times, and error results. Discovery of
+more than 16 laser nodes is a configuration fault and prevents the game from
+being armed.
 
 ## Node Commissioning and Addressing
 
@@ -414,7 +419,7 @@ operator.
 
 The setup view must provide:
 
-- bus rescan and shared node reset;
+- bus rescan and per-node event-counter reset;
 - a list of address, role, firmware/protocol version, and connection state;
 - an Identify action that flashes the selected physical node for four seconds;
 - commissioning, role assignment, and factory reset;
@@ -659,7 +664,7 @@ and native test targets, and all CRC/layout tests pass.
 - Implement the minimum ATtiny USI-based I2C target transport at commissioning
   address `0x08`: register-pointer selection, coherent read snapshots, and the
   read-only `IDENTITY` register with CRC.
-- Implement the Pico sensor-bus initialization on GPIO 16/17 at 100 kHz,
+- Implement the Pico sensor-bus initialization on GPIO 16/17 at 10 kHz,
   address probing, `IDENTITY` reading, CRC validation, protocol validation, and
   serial diagnostics.
 - Repeatedly read the real node, then test disconnect and reconnect behavior.
@@ -679,8 +684,9 @@ during I2C operation. Common ground and appropriate board power must remain.
 - Implement the ATtiny boot counter, ADC sampling/filtering, hysteresis,
   stable-time validation, cooldown, event counter, and hardware-timed status
   LED behavior.
-- Implement controller polling at least ten times per second, modulo-16-bit
-  event differences, restart detection, retries, and serial diagnostics.
+- Implement continuous controller polling, targeting about ten complete cycles
+  per second for the normal 8–12-node installation, with modulo-16-bit event
+  differences, restart detection, retries, and serial diagnostics.
 - Tune initial detection values using the real lasers and representative
   ambient conditions.
 
@@ -708,15 +714,17 @@ reliably, and recover through factory reset.
   non-blocking `FU` pulse, and start/finish event counters.
 - Implement Pico `FU` timestamp capture, deferred reads of both button counters,
   overlap detection, periodic counter verification, and event-line faults.
-- Implement complete discovery/inventory validation and shared `AT_RS` reset.
-- Test the full intended inventory on the representative branched 10 m harness;
+- Implement complete discovery/inventory validation. No shared hardware reset
+  is available on the assembled node boards.
+- Test the normal 8–12-node inventory on a representative branched harness and
+  confirm that inventories up to 18 nodes remain accepted;
   record bus speed, branch lengths, rise times, retries, polling rate, and
   errors.
 
-**Exit criterion:** the controller discovers and validates all 18 nodes,
-distinguishes and timestamps start/finish events, observes every laser counter
-at the required rate, and detects disconnects, restarts, invalid inventories,
-and `FU` faults.
+**Exit criterion:** the controller accepts and validates inventories of up to
+18 nodes, the normal 8–12-node installation is stable at its measured polling
+rate, start/finish events are distinguished and timestamped, and disconnects,
+restarts, invalid inventories, and `FU` faults are detected.
 
 ### 2. Game Engine
 

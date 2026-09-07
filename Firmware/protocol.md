@@ -14,19 +14,23 @@ safe retry behavior where it is needed.
 
 - The Pico W is the only I2C controller (master). Nodes are targets (slaves)
   and never initiate I2C traffic.
-- The initial bus speed is 100 kHz.
-- The supported installation has at most 16 laser nodes, one start node, and
-  one finish node on a representative branched harness of about 10 m.
+- The sensor bus runs at 10 kHz. It was reduced from the initial 100 kHz after
+  communication failures appeared on the assembled branched wiring.
+- The controller accepts at most 16 laser nodes, one start node, and one finish
+  node. Normal operation is expected to use about 8–12 total nodes on a
+  branched harness representative of the actual installation.
 - Node PB0 is SDA and PB2 is SCL. Pico GPIO 16 is SDA and GPIO 17 is SCL
   (I2C0).
 - `FU` is a separate shared active-low, open-drain event line on node PB4 and
   Pico GPIO 19. Only start and finish nodes may assert it.
-- `AT_RS` is the shared active-low reset line driven from Pico GPIO 18.
+- Pico GPIO18 does not provide a usable node reset because the reset jumpers on
+  the assembled node PCBs are not fitted. Firmware must not rely on `AT_RS`.
 - Multi-byte integers use little-endian byte order.
 
-The final bus speed must be validated on the complete harness with all 18
-nodes. Tested branch lengths, rise times, transaction errors, and retry counts
-must be recorded.
+The final bus speed must be validated with the representative normal inventory.
+Inventories up to 18 nodes remain valid but have a slower polling cycle. Tested
+node count, branch lengths, rise times, transaction errors, polling duration,
+and retry counts must be recorded.
 
 ## 2. Addressing and discovery
 
@@ -241,9 +245,12 @@ The event counter wraps modulo 65536. Reading never clears it. The controller
 calculates modulo-16-bit differences from its stored baseline or previous
 sample.
 
-At 100 kHz, selecting and reading this block uses approximately 0.9 ms per node
-before software overhead. Polling all 18 nodes ten times per second therefore
-uses about 16% of nominal bus time before retries.
+At 10 kHz, selecting and reading this block uses approximately 9 ms per node
+before software overhead. A sequential poll of all 18 nodes therefore takes at
+least about 162 ms and cannot meet a ten-polls-per-second full-inventory target
+with the current transaction format. The measured stable node count and poll
+duration must be used to revise the polling strategy or rate before closing bus
+qualification.
 
 ### 6.3 `0x18 DIAGNOSTICS`
 
@@ -515,6 +522,7 @@ EEPROM configuration-format version are independent of protocol version.
 - Test counter reset and zero verification on every node before each run.
 - Test EEPROM interruption, invalid stored CRC, commissioning, address-change
   recovery, and factory reset.
-- Test node reset and 16-bit event-counter wrap during a run.
-- Measure timing, retries, rise times, and ten-Hz polling using all 18 nodes on
-  the representative branched 10 m harness.
+- Test node power-cycle detection and 16-bit event-counter wrap during a run.
+- Measure timing, retries, rise times, and achieved polling rate using the
+  normal 8–12-node inventory on a representative branched harness;
+  separately confirm that an inventory of up to 18 nodes is accepted.

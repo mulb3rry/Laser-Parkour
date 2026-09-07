@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <Wire.h>
+#include <stdlib.h>
 
 #include "laser_protocol.h"
 
@@ -9,17 +10,35 @@ constexpr uint8_t PIN_SENSOR_SDA = 16;
 constexpr uint8_t PIN_SENSOR_SCL = 17;
 constexpr uint8_t PIN_NODE_RESET = 18;
 constexpr uint8_t PIN_EVENT = 19;
-constexpr uint32_t SENSOR_BUS_FREQUENCY_HZ = 100000;
+constexpr uint32_t SENSOR_BUS_FREQUENCY_HZ = 10000;
 constexpr uint32_t POLL_INTERVAL_MS = 100;
+
+struct NodeInventoryEntry {
+  uint8_t address;
+  lp_identity_register_t identity;
+  uint16_t bootCounter;
+  uint16_t eventCounter;
+  bool baselineValid;
+  bool available;
+};
+
+struct SensorConfigValues {
+  uint16_t threshold;
+  uint16_t hysteresis;
+  uint16_t stableTimeMs;
+  uint16_t cooldownMs;
+};
+
+NodeInventoryEntry inventory[LP_MAX_TOTAL_NODES];
+uint8_t inventoryCount = 0U;
+bool inventoryOverflow = false;
 
 uint32_t successfulReads = 0;
 uint32_t failedReads = 0;
+uint32_t pollCycles = 0;
+uint32_t lastPollDurationUs = 0;
+uint32_t maximumPollDurationUs = 0;
 uint32_t lastPollMs = 0;
-bool nodeWasAvailable = false;
-bool statusBaselineValid = false;
-bool statusWasAvailable = false;
-uint16_t lastBootCounter = 0U;
-uint16_t lastEventCounter = 0U;
 uint8_t nodeAddress = LP_ADDRESS_COMMISSIONING;
 uint8_t commandSequence = 0U;
 volatile bool fuEdgePending = false;
@@ -27,6 +46,16 @@ volatile uint32_t fuEdgeTimestampUs = 0U;
 volatile uint32_t fuEdgeCount = 0U;
 volatile bool fuRisePending = false;
 volatile uint32_t fuPulseWidthUs = 0U;
+bool fuCorrelationPending = false;
+uint32_t fuCorrelationDueMs = 0U;
+uint8_t pendingCommissionRole = LP_ROLE_UNCONFIGURED;
+bool pendingNodeSelection = false;
+uint8_t pendingAddress = 0U;
+uint8_t pendingAddressDigits = 0U;
+SensorConfigValues lastSensorConfig{240U, 16U, 30U, 500U};
+bool pendingSensorConfig = false;
+char sensorConfigInput[48]{};
+uint8_t sensorConfigInputLength = 0U;
 
 enum class IdentityReadResult : uint8_t {
   OK,
@@ -91,6 +120,116 @@ const char *roleName(uint8_t role) {
 void printIdentity(const lp_identity_register_t &identity);
 void printDiagnostics(void);
 void printNodeDiagnostics(const lp_diagnostics_register_t &diagnostics);
+bool discoverInventory(void);
+void pollInventory(void);
+
+void printInventory(void) {
+  Serial.print("Inventory: ");
+  Serial.print(inventoryCount);
+  Serial.println(" node(s)");
+  for (uint8_t index = 0U; index < inventoryCount; ++index) {
+    Serial.print("  0x");
+    Serial.print(inventory[index].address, HEX);
+    Serial.print(" ");
+    Serial.print(roleName(inventory[index].identity.role));
+    if (inventory[index].address == nodeAddress) {
+      Serial.print(" [selected]");
+    }
+    Serial.println();
+  }
+}
+
+void printLogSeparator(void) {
+  for (uint8_t line = 0U; line < 6U; ++line) {
+    Serial.println();
+  }
+}
+
+bool validateInventory(void) {
+  uint8_t laserCount = 0U;
+  uint8_t startCount = 0U;
+  uint8_t finishCount = 0U;
+  uint8_t unconfiguredCount = 0U;
+  bool valid = true;
+
+  for (uint8_t index = 0U; index < inventoryCount; ++index) {
+    const lp_identity_register_t &identity = inventory[index].identity;
+    const uint16_t capabilities = lp_u16_decode(identity.capabilities);
+
+    if (identity.config_format_version != LP_CONFIG_FORMAT_VERSION) {
+      Serial.print("INVENTORY FAULT: unsupported config format at 0x");
+      Serial.println(identity.address, HEX);
+      valid = false;
+    }
+
+    if (identity.role == LP_ROLE_LASER) {
+      ++laserCount;
+      if ((capabilities & LP_CAPABILITY_LASER_SENSING) == 0U) {
+        Serial.print("INVENTORY FAULT: laser 0x");
+        Serial.print(identity.address, HEX);
+        Serial.println(" lacks laser-sensing capability");
+        valid = false;
+      }
+    } else if (identity.role == LP_ROLE_START) {
+      ++startCount;
+      if ((capabilities & (LP_CAPABILITY_BUTTON_INPUT |
+                           LP_CAPABILITY_FU_OUTPUT)) !=
+          (LP_CAPABILITY_BUTTON_INPUT | LP_CAPABILITY_FU_OUTPUT)) {
+        Serial.print("INVENTORY FAULT: start 0x");
+        Serial.print(identity.address, HEX);
+        Serial.println(" lacks button/FU capability");
+        valid = false;
+      }
+    } else if (identity.role == LP_ROLE_FINISH) {
+      ++finishCount;
+      if ((capabilities & (LP_CAPABILITY_BUTTON_INPUT |
+                           LP_CAPABILITY_FU_OUTPUT)) !=
+          (LP_CAPABILITY_BUTTON_INPUT | LP_CAPABILITY_FU_OUTPUT)) {
+        Serial.print("INVENTORY FAULT: finish 0x");
+        Serial.print(identity.address, HEX);
+        Serial.println(" lacks button/FU capability");
+        valid = false;
+      }
+    } else {
+      ++unconfiguredCount;
+    }
+  }
+
+  if (laserCount > LP_MAX_LASER_NODES) {
+    Serial.println("INVENTORY FAULT: more than 16 laser nodes");
+    valid = false;
+  }
+  if (inventoryOverflow) {
+    Serial.println("INVENTORY FAULT: more than 18 nodes responded");
+    valid = false;
+  }
+  if (startCount != 1U) {
+    Serial.print("INVENTORY FAULT: expected one start node, found ");
+    Serial.println(startCount);
+    valid = false;
+  }
+  if (finishCount != 1U) {
+    Serial.print("INVENTORY FAULT: expected one finish node, found ");
+    Serial.println(finishCount);
+    valid = false;
+  }
+  if (unconfiguredCount != 0U) {
+    Serial.print("INVENTORY FAULT: uncommissioned nodes found: ");
+    Serial.println(unconfiguredCount);
+    valid = false;
+  }
+
+  Serial.print("Inventory validation: ");
+  Serial.print(valid ? "VALID" : "INVALID");
+  Serial.print(" (lasers=");
+  Serial.print(laserCount);
+  Serial.print(", start=");
+  Serial.print(startCount);
+  Serial.print(", finish=");
+  Serial.print(finishCount);
+  Serial.println(')');
+  return valid;
+}
 
 bool readRegisterBlock(uint8_t registerAddress, uint8_t *bytes,
                        size_t expected) {
@@ -157,21 +296,64 @@ bool readIdentity(lp_identity_register_t &identity) {
   return true;
 }
 
-bool discoverNode(void) {
+int8_t inventoryIndexForAddress(uint8_t address) {
+  for (uint8_t index = 0U; index < inventoryCount; ++index) {
+    if (inventory[index].address == address) {
+      return static_cast<int8_t>(index);
+    }
+  }
+  return -1;
+}
+
+void addDiscoveredNode(uint8_t address,
+                       const lp_identity_register_t &identity) {
+  if (inventoryCount >= LP_MAX_TOTAL_NODES) {
+    Serial.println("Inventory full; additional node ignored");
+    inventoryOverflow = true;
+    return;
+  }
+  NodeInventoryEntry &entry = inventory[inventoryCount++];
+  entry.address = address;
+  entry.identity = identity;
+  entry.bootCounter = 0U;
+  entry.eventCounter = 0U;
+  entry.baselineValid = false;
+  entry.available = true;
+}
+
+bool discoverInventory(void) {
+  const uint8_t previousSelection = nodeAddress;
+  inventoryCount = 0U;
+  inventoryOverflow = false;
   lp_identity_register_t identity{};
   nodeAddress = LP_ADDRESS_COMMISSIONING;
   if (readIdentity(identity)) {
-    return true;
+    addDiscoveredNode(nodeAddress, identity);
   }
   for (uint8_t address = LP_ADDRESS_NORMAL_MIN;
        address <= LP_ADDRESS_NORMAL_MAX; ++address) {
     nodeAddress = address;
     if (readIdentity(identity)) {
-      return true;
+      addDiscoveredNode(address, identity);
     }
   }
-  nodeAddress = LP_ADDRESS_COMMISSIONING;
-  return false;
+
+  if (inventoryCount == 0U) {
+    nodeAddress = LP_ADDRESS_COMMISSIONING;
+    return false;
+  }
+  if (inventoryIndexForAddress(LP_ADDRESS_COMMISSIONING) >= 0) {
+    nodeAddress = LP_ADDRESS_COMMISSIONING;
+  } else if (inventoryIndexForAddress(previousSelection) >= 0) {
+    nodeAddress = previousSelection;
+  } else {
+    nodeAddress = inventory[0].address;
+  }
+  return true;
+}
+
+bool discoverNode(void) {
+  return discoverInventory();
 }
 
 bool readFastStatus(lp_fast_status_register_t &status) {
@@ -267,8 +449,10 @@ void saveStagedConfiguration(void) {
     Serial.print(" to 0x");
     Serial.println(nodeAddress, HEX);
     printIdentity(savedIdentity);
-    statusBaselineValid = false;
-    statusWasAvailable = false;
+    (void)discoverInventory();
+    pollInventory();
+    printInventory();
+    (void)validateInventory();
   } else {
     Serial.println("Saved node did not validate at its resulting address");
   }
@@ -276,15 +460,42 @@ void saveStagedConfiguration(void) {
 
 void rescanNode(void) {
   if (discoverNode()) {
-    Serial.print("Discovered node at 0x");
+    pollInventory();
+    Serial.print("Rescan complete: ");
+    Serial.print(inventoryCount);
+    Serial.print(" node(s), selected 0x");
     Serial.println(nodeAddress, HEX);
-    statusBaselineValid = false;
-    statusWasAvailable = false;
-    nodeWasAvailable = false;
-    printDiagnostics();
+    (void)validateInventory();
   } else {
     Serial.println("No valid node discovered from 0x08 or 0x10-0x6F");
   }
+}
+
+void selectNode(uint8_t address) {
+  const int8_t index = inventoryIndexForAddress(address);
+  if (index < 0) {
+    Serial.print("Cannot select 0x");
+    Serial.print(address, HEX);
+    Serial.println(": address is not in the current inventory");
+    return;
+  }
+  nodeAddress = address;
+  Serial.print("Selected 0x");
+  Serial.print(nodeAddress, HEX);
+  Serial.print(" ");
+  Serial.println(roleName(inventory[index].identity.role));
+}
+
+void selectNextNode(void) {
+  if (inventoryCount == 0U) {
+    Serial.println("No node available to select");
+    return;
+  }
+  const int8_t current = inventoryIndexForAddress(nodeAddress);
+  const uint8_t next = current < 0
+                           ? 0U
+                           : static_cast<uint8_t>((current + 1) % inventoryCount);
+  selectNode(inventory[next].address);
 }
 
 bool runSimpleCommand(uint8_t command, const uint8_t arguments[4],
@@ -320,7 +531,10 @@ void resetNodeCounter(void) {
   const uint8_t arguments[4] = {
       static_cast<uint8_t>(token), static_cast<uint8_t>(token >> 8U), 0U, 0U};
   if (runSimpleCommand(LP_COMMAND_RESET_COUNTER, arguments, "RESET_COUNTER")) {
-    statusBaselineValid = false;
+    const int8_t index = inventoryIndexForAddress(nodeAddress);
+    if (index >= 0) {
+      inventory[index].baselineValid = false;
+    }
   }
 }
 
@@ -366,9 +580,37 @@ void printNodeDiagnostics(const lp_diagnostics_register_t &diagnostics) {
   Serial.println(" ms");
 }
 
-void stageIdentity(uint8_t role, const char *roleLabel) {
+void stageIdentity(uint8_t role, uint8_t targetAddress,
+                   const char *roleLabel) {
+  uint8_t matchingRoles = 0U;
+  uint8_t laserNodes = 0U;
+  for (uint8_t index = 0U; index < inventoryCount; ++index) {
+    if (inventory[index].identity.role == role) {
+      ++matchingRoles;
+    }
+    if (inventory[index].identity.role == LP_ROLE_LASER) {
+      ++laserNodes;
+    }
+  }
+  if ((role == LP_ROLE_START || role == LP_ROLE_FINISH) &&
+      matchingRoles != 0U) {
+    Serial.print("Cannot stage identity: a ");
+    Serial.print(roleLabel);
+    Serial.println(" node already exists");
+    return;
+  }
+  if (role == LP_ROLE_LASER && laserNodes >= LP_MAX_LASER_NODES) {
+    Serial.println("Cannot stage identity: 16 laser nodes already exist");
+    return;
+  }
+  if (inventoryIndexForAddress(targetAddress) >= 0) {
+    Serial.print("Cannot stage identity: address 0x");
+    Serial.print(targetAddress, HEX);
+    Serial.println(" is already occupied");
+    return;
+  }
   lp_staged_identity_register_t staged{
-      .address = LP_ADDRESS_NORMAL_MIN,
+      .address = targetAddress,
       .role = role,
       .crc8 = 0U,
   };
@@ -388,7 +630,7 @@ void stageIdentity(uint8_t role, const char *roleLabel) {
     return;
   }
   if (nodeDiagnostics.last_result != LP_RESULT_OK) {
-    Serial.print("Staged identity rejected, result=");
+    Serial.print("Staged identity REJECTED, result=");
     Serial.println(nodeDiagnostics.last_result);
     return;
   }
@@ -397,61 +639,59 @@ void stageIdentity(uint8_t role, const char *roleLabel) {
       memcmp(&staged, &readback, sizeof(staged)) == 0) {
     Serial.print("Staged ");
     Serial.print(roleLabel);
-    Serial.println(" identity accepted and read back: address 0x10");
+    Serial.print(" identity accepted and read back: address 0x");
+    Serial.println(targetAddress, HEX);
   } else {
-    Serial.println("Staged identity readback mismatch or rejection");
+    Serial.println("Staged identity readback MISMATCH or REJECTION");
   }
 }
 
-void factoryResetNode(bool validKey) {
+void factoryResetNode(void) {
   const uint8_t arguments[4] = {
-      static_cast<uint8_t>(validKey ? LP_FACTORY_RESET_ARG0 : 0U),
-      static_cast<uint8_t>(validKey ? LP_FACTORY_RESET_ARG1 : 0U),
-      static_cast<uint8_t>(validKey ? LP_FACTORY_RESET_ARG2 : 0U),
-      static_cast<uint8_t>(validKey ? LP_FACTORY_RESET_ARG3 : 0U),
+      LP_FACTORY_RESET_ARG0,
+      LP_FACTORY_RESET_ARG1,
+      LP_FACTORY_RESET_ARG2,
+      LP_FACTORY_RESET_ARG3,
   };
   lp_command_result_register_t result{};
   if (!sendCommand(LP_COMMAND_FACTORY_RESET, arguments, result)) {
     Serial.println("FACTORY_RESET timed out or failed on I2C");
     return;
   }
-  Serial.print(validKey ? "FACTORY_RESET" : "FACTORY_RESET bad-key test");
+  Serial.print("FACTORY_RESET");
   Serial.print(" result=");
   Serial.print(result.result);
   Serial.print(", detail=");
   Serial.println(lp_u16_decode(result.detail));
-  if (!validKey || result.result != LP_RESULT_OK) {
+  if (result.result != LP_RESULT_OK) {
     return;
   }
 
   delay(50);
   nodeAddress = LP_ADDRESS_COMMISSIONING;
-  statusBaselineValid = false;
-  statusWasAvailable = false;
-  nodeWasAvailable = false;
   if (discoverNode()) {
     Serial.print("Factory-reset node discovered at 0x");
     Serial.println(nodeAddress, HEX);
+    printInventory();
+    (void)validateInventory();
+    pollInventory();
     printDiagnostics();
   } else {
     Serial.println("Factory-reset node was not rediscovered");
   }
 }
 
-void stageDefaultSensorConfig(bool corruptCrc) {
+void stageSensorConfig(const SensorConfigValues &values) {
   lp_sensor_config_register_t config{
-      .broken_threshold = lp_u16_encode(240U),
-      .hysteresis = lp_u16_encode(16U),
-      .stable_time_ms = lp_u16_encode(30U),
-      .cooldown_ms = lp_u16_encode(500U),
+      .broken_threshold = lp_u16_encode(values.threshold),
+      .hysteresis = lp_u16_encode(values.hysteresis),
+      .stable_time_ms = lp_u16_encode(values.stableTimeMs),
+      .cooldown_ms = lp_u16_encode(values.cooldownMs),
       .crc8 = 0U,
   };
   config.crc8 = lp_register_crc8(
       LP_REGISTER_STAGED_SENSOR_CONFIG,
       reinterpret_cast<const uint8_t *>(&config), sizeof(config) - 1U);
-  if (corruptCrc) {
-    config.crc8 ^= 0x01U;
-  }
   if (!writeRegisterBlock(LP_REGISTER_STAGED_SENSOR_CONFIG,
                           reinterpret_cast<const uint8_t *>(&config),
                           sizeof(config))) {
@@ -463,16 +703,12 @@ void stageDefaultSensorConfig(bool corruptCrc) {
   if (readNodeDiagnostics(nodeDiagnostics)) {
     printNodeDiagnostics(nodeDiagnostics);
     if (nodeDiagnostics.last_result != LP_RESULT_OK) {
-      Serial.print("Staged sensor configuration rejected, result=");
+      Serial.print("Staged sensor configuration REJECTED, result=");
       Serial.println(nodeDiagnostics.last_result);
       return;
     }
   } else {
     Serial.println("Could not read staged sensor-config write result");
-    return;
-  }
-  if (corruptCrc) {
-    Serial.println("Sent intentionally corrupted sensor-config CRC");
     return;
   }
   lp_sensor_config_register_t readback{};
@@ -481,7 +717,7 @@ void stageDefaultSensorConfig(bool corruptCrc) {
     Serial.println("Staged sensor configuration accepted and read back");
     printSensorConfig("Staged sensor config", readback);
   } else {
-    Serial.println("Staged sensor-config readback mismatch or rejection");
+    Serial.println("Staged sensor-config readback MISMATCH or REJECTION");
   }
 }
 
@@ -494,52 +730,114 @@ bool readWithRetries(lp_fast_status_register_t &status) {
   return false;
 }
 
-void pollFastStatus(void) {
+uint16_t pollInventoryEntry(uint8_t index, bool dueToFu) {
+  NodeInventoryEntry &entry = inventory[index];
+  const uint8_t selectedAddress = nodeAddress;
+  nodeAddress = entry.address;
+
   lp_fast_status_register_t status{};
   if (!readWithRetries(status)) {
-    if (statusWasAvailable) {
-      Serial.print("Node status unavailable after retries: ");
+    ++failedReads;
+    if (entry.available) {
+      Serial.print("Node 0x");
+      Serial.print(entry.address, HEX);
+      Serial.print(" unavailable: ");
       Serial.println(readResultName(lastReadResult));
     }
-    statusWasAvailable = false;
-    return;
+    entry.available = false;
+    nodeAddress = selectedAddress;
+    return 0U;
   }
 
+  ++successfulReads;
+  if (!entry.available) {
+    Serial.print("Node 0x");
+    Serial.print(entry.address, HEX);
+    Serial.println(" reconnected");
+  }
+  entry.available = true;
   const uint16_t bootCounter = lp_u16_decode(status.boot_counter);
   const uint16_t eventCounter = lp_u16_decode(status.event_counter);
-  statusWasAvailable = true;
-  if (!statusBaselineValid) {
-    lastBootCounter = bootCounter;
-    lastEventCounter = eventCounter;
-    statusBaselineValid = true;
-    printFastStatus(status);
-    return;
+  if (!entry.baselineValid) {
+    entry.bootCounter = bootCounter;
+    entry.eventCounter = eventCounter;
+    entry.baselineValid = true;
+    nodeAddress = selectedAddress;
+    return 0U;
   }
 
-  if (bootCounter != lastBootCounter) {
-    Serial.print("NODE RESTART detected: boot counter ");
-    Serial.print(lastBootCounter);
+  if (bootCounter != entry.bootCounter) {
+    Serial.print("NODE RESTART at 0x");
+    Serial.print(entry.address, HEX);
+    Serial.print(": ");
+    Serial.print(entry.bootCounter);
     Serial.print(" -> ");
     Serial.println(bootCounter);
-    lastBootCounter = bootCounter;
-    lastEventCounter = eventCounter;
-    return;
+    entry.bootCounter = bootCounter;
+    entry.eventCounter = eventCounter;
+    nodeAddress = selectedAddress;
+    return 0U;
   }
 
-  const uint16_t eventDifference =
-      static_cast<uint16_t>(eventCounter - lastEventCounter);
-  if (eventDifference != 0U) {
-    Serial.print("Node events: +");
-    Serial.print(eventDifference);
+  const uint16_t difference =
+      static_cast<uint16_t>(eventCounter - entry.eventCounter);
+  if (difference != 0U) {
+    Serial.print(dueToFu ? "FU source " : "Periodic event ");
+    Serial.print(roleName(entry.identity.role));
+    Serial.print(" node 0x");
+    Serial.print(entry.address, HEX);
+    Serial.print(": +");
+    Serial.print(difference);
     Serial.print(" (total ");
     Serial.print(eventCounter);
     Serial.println(')');
-    lastEventCounter = eventCounter;
-
-    lp_diagnostics_register_t diagnostics{};
-    if (readNodeDiagnostics(diagnostics)) {
-      printNodeDiagnostics(diagnostics);
+    if (!dueToFu && (entry.identity.role == LP_ROLE_START ||
+                     entry.identity.role == LP_ROLE_FINISH)) {
+      Serial.println("  WARNING: button counter advanced without captured FU edge");
     }
+    entry.eventCounter = eventCounter;
+  }
+  nodeAddress = selectedAddress;
+  return difference;
+}
+
+void pollInventory(void) {
+  const uint32_t startedUs = micros();
+  for (uint8_t index = 0U; index < inventoryCount; ++index) {
+    const uint8_t role = inventory[index].identity.role;
+    if (fuCorrelationPending &&
+        (role == LP_ROLE_START || role == LP_ROLE_FINISH)) {
+      continue;
+    }
+    (void)pollInventoryEntry(index, false);
+  }
+  lastPollDurationUs = micros() - startedUs;
+  if (lastPollDurationUs > maximumPollDurationUs) {
+    maximumPollDurationUs = lastPollDurationUs;
+  }
+  ++pollCycles;
+}
+
+void correlateFuEdge(void) {
+  if (!fuCorrelationPending ||
+      static_cast<int32_t>(millis() - fuCorrelationDueMs) < 0) {
+    return;
+  }
+  fuCorrelationPending = false;
+  uint8_t sources = 0U;
+  for (uint8_t index = 0U; index < inventoryCount; ++index) {
+    const uint8_t role = inventory[index].identity.role;
+    if (role != LP_ROLE_START && role != LP_ROLE_FINISH) {
+      continue;
+    }
+    if (pollInventoryEntry(index, true) != 0U) {
+      ++sources;
+    }
+  }
+  if (sources == 0U) {
+    Serial.println("FU FAULT: no button counter advanced");
+  } else if (sources > 1U) {
+    Serial.println("FU overlap: multiple button counters advanced");
   }
 }
 
@@ -563,9 +861,8 @@ void handleFuEdge(void) {
     Serial.print(" at ");
     Serial.print(timestampUs);
     Serial.println(" us");
-    // This single-node test immediately correlates the edge with the selected
-    // node. Full inventory handling will read both button counters.
-    pollFastStatus();
+    fuCorrelationPending = true;
+    fuCorrelationDueMs = millis() + 15U;
   }
   if (rising) {
     Serial.print("FU low pulse: ");
@@ -598,34 +895,7 @@ void printIdentity(const lp_identity_register_t &identity) {
   Serial.println(identity.crc8, HEX);
 }
 
-void pollIdentity(void) {
-  lp_identity_register_t identity{};
-  if (readIdentity(identity)) {
-    ++successfulReads;
-    if (!nodeWasAvailable) {
-      Serial.println("Node connected and validated");
-      printIdentity(identity);
-    }
-    nodeWasAvailable = true;
-
-    if (successfulReads % 100U == 0U) {
-      Serial.print("Identity reads passed: ");
-      Serial.print(successfulReads);
-      Serial.print(", failed: ");
-      Serial.println(failedReads);
-    }
-  } else {
-    ++failedReads;
-    if (nodeWasAvailable || failedReads == 1U) {
-      Serial.print("Node unavailable or identity invalid: ");
-      Serial.println(readResultName(lastReadResult));
-    }
-    nodeWasAvailable = false;
-  }
-}
-
 void printDiagnostics(void) {
-  Serial.println();
   Serial.println("Laser Parkour protocol identity test");
   Serial.print("Sensor bus: I2C0, SDA=GPIO16, SCL=GPIO17, ");
   Serial.print(SENSOR_BUS_FREQUENCY_HZ / 1000U);
@@ -634,14 +904,20 @@ void printDiagnostics(void) {
   Serial.print(digitalRead(PIN_SENSOR_SDA));
   Serial.print(", SCL=");
   Serial.println(digitalRead(PIN_SENSOR_SCL));
-  Serial.print("Identity reads passed: ");
+  Serial.print("Node polls passed: ");
   Serial.print(successfulReads);
   Serial.print(", failed: ");
   Serial.println(failedReads);
+  Serial.print("Inventory poll cycles: ");
+  Serial.print(pollCycles);
+  Serial.print(", last/max duration: ");
+  Serial.print(lastPollDurationUs);
+  Serial.print('/');
+  Serial.print(maximumPollDurationUs);
+  Serial.println(" us");
 
   lp_identity_register_t identity{};
   if (readIdentity(identity)) {
-    nodeWasAvailable = true;
     Serial.println("Node connected and validated");
     printIdentity(identity);
     lp_fast_status_register_t status{};
@@ -652,8 +928,16 @@ void printDiagnostics(void) {
     if (readNodeDiagnostics(diagnostics)) {
       printNodeDiagnostics(diagnostics);
     }
+    if (identity.role == LP_ROLE_LASER) {
+      lp_sensor_config_register_t activeConfig{};
+      if (readSensorConfig(LP_REGISTER_ACTIVE_SENSOR_CONFIG, activeConfig)) {
+        printSensorConfig("Active sensor config", activeConfig);
+      } else {
+        Serial.print("Active sensor config unavailable: ");
+        Serial.println(readResultName(lastReadResult));
+      }
+    }
   } else {
-    nodeWasAvailable = false;
     Serial.print("Node unavailable or identity invalid: ");
     Serial.println(readResultName(lastReadResult));
     Serial.print("  Wire result: ");
@@ -665,37 +949,278 @@ void printDiagnostics(void) {
   }
 }
 
+bool isConfigDelimiter(char value) {
+  return value == ',' || value == ' ' || value == '\t';
+}
+
+bool parseSensorConfig(char *input, SensorConfigValues &values) {
+  uint16_t parsed[4]{};
+  char *cursor = input;
+  for (uint8_t index = 0U; index < 4U; ++index) {
+    while (isConfigDelimiter(*cursor)) {
+      ++cursor;
+    }
+    if (*cursor == '\0') {
+      return false;
+    }
+    char *end = nullptr;
+    const int base = cursor[0] == '0' &&
+                             (cursor[1] == 'x' || cursor[1] == 'X')
+                         ? 16
+                         : 10;
+    const unsigned long value = strtoul(cursor, &end, base);
+    if (end == cursor || value > 65535UL) {
+      return false;
+    }
+    parsed[index] = static_cast<uint16_t>(value);
+    cursor = end;
+    if (index < 3U && !isConfigDelimiter(*cursor)) {
+      return false;
+    }
+  }
+  while (isConfigDelimiter(*cursor)) {
+    ++cursor;
+  }
+  if (*cursor != '\0') {
+    return false;
+  }
+  values = SensorConfigValues{parsed[0], parsed[1], parsed[2], parsed[3]};
+  return true;
+}
+
+bool selectedNodeAcceptsSensorConfig(void) {
+  const int8_t index = inventoryIndexForAddress(nodeAddress);
+  if (index < 0) {
+    Serial.println("Cannot configure sensor: selected node is not in the inventory");
+    return false;
+  }
+  const uint8_t role = inventory[index].identity.role;
+  if (role == LP_ROLE_LASER) {
+    return true;
+  }
+  if (role == LP_ROLE_UNCONFIGURED) {
+    lp_staged_identity_register_t staged{};
+    if (readStagedIdentity(staged) && staged.role == LP_ROLE_LASER) {
+      return true;
+    }
+    Serial.println(
+        "Cannot configure sensor: stage a laser identity on this node first");
+    return false;
+  }
+  Serial.print("Cannot configure sensor: selected node role is ");
+  Serial.println(roleName(role));
+  return false;
+}
+
+void beginSensorConfigEntry(void) {
+  pendingSensorConfig = true;
+  sensorConfigInputLength = 0U;
+  Serial.println(
+      "Enter threshold,hysteresis,stable_ms,cooldown_ms, or press Return to reuse:");
+  Serial.print("Last values: ");
+  Serial.print(lastSensorConfig.threshold);
+  Serial.print(',');
+  Serial.print(lastSensorConfig.hysteresis);
+  Serial.print(',');
+  Serial.print(lastSensorConfig.stableTimeMs);
+  Serial.print(',');
+  Serial.println(lastSensorConfig.cooldownMs);
+}
+
+bool consumeSensorConfig(char value) {
+  if (!pendingSensorConfig) {
+    return false;
+  }
+  if (value == '\r' || value == '\n') {
+    pendingSensorConfig = false;
+    if (sensorConfigInputLength == 0U) {
+      stageSensorConfig(lastSensorConfig);
+      return true;
+    }
+    sensorConfigInput[sensorConfigInputLength] = '\0';
+    SensorConfigValues parsed{};
+    if (!parseSensorConfig(sensorConfigInput, parsed)) {
+      Serial.println(
+          "Configuration cancelled: expected four values separated by commas or spaces");
+      return true;
+    }
+    lastSensorConfig = parsed;
+    stageSensorConfig(lastSensorConfig);
+    return true;
+  }
+  if ((value == '\b' || value == 0x7F) && sensorConfigInputLength != 0U) {
+    --sensorConfigInputLength;
+    return true;
+  }
+  if (sensorConfigInputLength >= sizeof(sensorConfigInput) - 1U) {
+    pendingSensorConfig = false;
+    sensorConfigInputLength = 0U;
+    Serial.println("Configuration cancelled: input is too long");
+    return true;
+  }
+  sensorConfigInput[sensorConfigInputLength++] = value;
+  return true;
+}
+
+int8_t hexNibble(char value) {
+  if (value >= '0' && value <= '9') {
+    return static_cast<int8_t>(value - '0');
+  }
+  if (value >= 'a' && value <= 'f') {
+    return static_cast<int8_t>(value - 'a' + 10);
+  }
+  if (value >= 'A' && value <= 'F') {
+    return static_cast<int8_t>(value - 'A' + 10);
+  }
+  return -1;
+}
+
+void beginCommissioningAddress(uint8_t role) {
+  pendingCommissionRole = role;
+  pendingNodeSelection = false;
+  pendingAddress = 0U;
+  pendingAddressDigits = 0U;
+  Serial.print("Enter two hex digits for the new ");
+  Serial.print(roleName(role));
+  Serial.println(" address (10-6F):");
+}
+
+void beginNodeSelection(void) {
+  pendingCommissionRole = LP_ROLE_UNCONFIGURED;
+  pendingNodeSelection = true;
+  pendingAddress = 0U;
+  pendingAddressDigits = 0U;
+  Serial.println("Enter two hex digits for the node address, or press Return to cycle:");
+}
+
+bool consumePendingAddress(char value) {
+  if (pendingCommissionRole == LP_ROLE_UNCONFIGURED &&
+      !pendingNodeSelection) {
+    return false;
+  }
+  if (pendingNodeSelection && pendingAddressDigits == 0U &&
+      (value == '\r' || value == '\n')) {
+    pendingNodeSelection = false;
+    selectNextNode();
+    return true;
+  }
+  if (value == ' ' || value == '\r' || value == '\n' || value == '\t') {
+    return true;
+  }
+
+  const int8_t nibble = hexNibble(value);
+  if (nibble < 0) {
+    Serial.println("Address entry cancelled: expected two hex digits");
+    pendingCommissionRole = LP_ROLE_UNCONFIGURED;
+    pendingNodeSelection = false;
+    pendingAddressDigits = 0U;
+    return true;
+  }
+
+  pendingAddress = static_cast<uint8_t>((pendingAddress << 4U) |
+                                        static_cast<uint8_t>(nibble));
+  ++pendingAddressDigits;
+  if (pendingAddressDigits < 2U) {
+    return true;
+  }
+
+  const uint8_t role = pendingCommissionRole;
+  const uint8_t address = pendingAddress;
+  const bool selectingNode = pendingNodeSelection;
+  pendingCommissionRole = LP_ROLE_UNCONFIGURED;
+  pendingNodeSelection = false;
+  pendingAddressDigits = 0U;
+  if (selectingNode) {
+    selectNode(address);
+    return true;
+  }
+  if (address < LP_ADDRESS_NORMAL_MIN || address > LP_ADDRESS_NORMAL_MAX) {
+    Serial.println("Commissioning cancelled: address must be 0x10-0x6F");
+    return true;
+  }
+  stageIdentity(role, address, roleName(role));
+  return true;
+}
+
+void printHelp(void) {
+  Serial.println("Commands:");
+  Serial.println("  h       print this help");
+  Serial.println("  d       completely rescan and rebuild the inventory");
+  Serial.println("  v       print the current inventory without rescanning");
+  Serial.println("  pXX     select discovered node address 0xXX");
+  Serial.println("  p<Enter> cycle to the next discovered node");
+  Serial.println("  r       print details for the selected node");
+  Serial.println("  iXX     stage a laser at hexadecimal address 0xXX");
+  Serial.println("  aXX     stage a start node at hexadecimal address 0xXX");
+  Serial.println("  eXX     stage a finish node at hexadecimal address 0xXX");
+  Serial.println("  cV,V,V,V stage threshold,hysteresis,stable_ms,cooldown_ms");
+  Serial.println("  c<Enter> reuse and stage the last sensor configuration");
+  Serial.println("  s       save and activate staged configuration");
+  Serial.println("  l       insert blank lines into the serial log");
+  Serial.println("  g / u   switch selected node to game / setup mode");
+  Serial.println("  z       reset the selected node event counter");
+  Serial.println("  n       identify the selected node for 4 seconds");
+  Serial.println("  f       factory-reset and restart the selected node");
+}
+
 void handleSerialInput(void) {
   while (Serial.available() != 0) {
     const char command = static_cast<char>(Serial.read());
-    if (command == 'r' || command == 'R') {
+    if (consumeSensorConfig(command)) {
+      continue;
+    }
+    if (consumePendingAddress(command)) {
+      continue;
+    }
+    if (command == 'h' || command == 'H') {
+      Serial.println();
+      printHelp();
+    } else if (command == 'r' || command == 'R') {
+      Serial.println();
       printDiagnostics();
     } else if (command == 'i' || command == 'I') {
-      stageIdentity(LP_ROLE_LASER, "laser");
+      Serial.println();
+      beginCommissioningAddress(LP_ROLE_LASER);
     } else if (command == 'a' || command == 'A') {
-      stageIdentity(LP_ROLE_START, "start");
+      Serial.println();
+      beginCommissioningAddress(LP_ROLE_START);
     } else if (command == 'e' || command == 'E') {
-      stageIdentity(LP_ROLE_FINISH, "finish");
+      Serial.println();
+      beginCommissioningAddress(LP_ROLE_FINISH);
     } else if (command == 'c' || command == 'C') {
-      stageDefaultSensorConfig(false);
-    } else if (command == 'x' || command == 'X') {
-      stageDefaultSensorConfig(true);
+      Serial.println();
+      if (selectedNodeAcceptsSensorConfig()) {
+        beginSensorConfigEntry();
+      }
     } else if (command == 's' || command == 'S') {
+      Serial.println();
       saveStagedConfiguration();
     } else if (command == 'd' || command == 'D') {
+      Serial.println();
       rescanNode();
+    } else if (command == 'v' || command == 'V') {
+      Serial.println();
+      printInventory();
+    } else if (command == 'p' || command == 'P') {
+      Serial.println();
+      beginNodeSelection();
+    } else if (command == 'l' || command == 'L') {
+      printLogSeparator();
     } else if (command == 'g' || command == 'G') {
+      Serial.println();
       setNodeMode(LP_MODE_GAME);
     } else if (command == 'u' || command == 'U') {
+      Serial.println();
       setNodeMode(LP_MODE_SETUP);
     } else if (command == 'z' || command == 'Z') {
+      Serial.println();
       resetNodeCounter();
     } else if (command == 'n' || command == 'N') {
+      Serial.println();
       identifyNode();
     } else if (command == 'f' || command == 'F') {
-      factoryResetNode(true);
-    } else if (command == 'q' || command == 'Q') {
-      factoryResetNode(false);
+      Serial.println();
+      factoryResetNode();
     }
   }
 }
@@ -722,32 +1247,19 @@ void setup() {
   Wire.begin();
   Wire.setClock(SENSOR_BUS_FREQUENCY_HZ);
   if (discoverNode()) {
-    Serial.print("Discovered node at 0x");
-    Serial.println(nodeAddress, HEX);
+    printInventory();
+    (void)validateInventory();
+    pollInventory();
   }
-  printDiagnostics();
-  Serial.println("Type 'r' to print these diagnostics again");
-  Serial.println("Type 'i' to stage laser identity 0x10");
-  Serial.println("Type 'a' to stage start identity 0x10");
-  Serial.println("Type 'e' to stage finish identity 0x10");
-  Serial.println("Type 'c' to stage the default sensor configuration");
-  Serial.println("Type 'x' to test rejection of a corrupted config CRC");
-  Serial.println("Type 's' to save and activate the staged configuration");
-  Serial.println("Type 'd' to rescan commissioning and normal addresses");
-  Serial.println("Type 'g' for game mode, 'u' for setup mode");
-  Serial.println("Type 'z' to reset the event counter");
-  Serial.println("Type 'n' to identify the selected node for 4 seconds");
-  Serial.println("Type 'q' to test a rejected factory-reset key");
-  Serial.println("Type 'f' to factory-reset and restart the selected node");
-  pollIdentity();
+  printHelp();
 }
 
 void loop() {
   handleSerialInput();
   handleFuEdge();
+  correlateFuEdge();
   if (millis() - lastPollMs >= POLL_INTERVAL_MS) {
     lastPollMs = millis();
-    pollIdentity();
-    pollFastStatus();
+    pollInventory();
   }
 }
