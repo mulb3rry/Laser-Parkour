@@ -1,23 +1,54 @@
 #include <Arduino.h>
 #include <Wire.h>
+#include <hardware/clocks.h>
+#include <hardware/gpio.h>
+#include <hardware/pwm.h>
 #include <stdlib.h>
 
+#include "laser_game_engine.h"
 #include "laser_protocol.h"
 
 namespace {
 
 constexpr uint8_t PIN_SENSOR_SDA = 16;
 constexpr uint8_t PIN_SENSOR_SCL = 17;
+constexpr uint8_t PIN_SPEAKER = 5;
 constexpr uint8_t PIN_NODE_RESET = 18;
 constexpr uint8_t PIN_EVENT = 19;
 constexpr uint32_t SENSOR_BUS_FREQUENCY_HZ = 10000;
 constexpr uint32_t POLL_INTERVAL_MS = 100;
+constexpr uint32_t START_CLEAR_INTERVAL_MS = 3000;
+
+struct SoundStep {
+  uint16_t frequencyHz;
+  uint16_t durationMs;
+};
+
+constexpr SoundStep SOUND_SETUP[] = {{440U, 100U}};
+constexpr SoundStep SOUND_WAIT_PLAYER[] = {{660U, 90U}};
+constexpr SoundStep SOUND_WAIT_START[] = {
+    {660U, 80U}, {0U, 40U}, {880U, 100U}};
+constexpr SoundStep SOUND_START[] = {{880U, 150U}};
+constexpr SoundStep SOUND_INTERRUPTION[] = {{220U, 250U}};
+constexpr SoundStep SOUND_INVALID_BUTTON[] = {
+    {300U, 70U}, {0U, 50U}, {300U, 70U}};
+constexpr SoundStep SOUND_START_BLOCKED[] = {
+    {330U, 100U}, {0U, 50U}, {220U, 180U}};
+constexpr SoundStep SOUND_START_REENABLED[] = {
+    {660U, 80U}, {0U, 40U}, {880U, 140U}};
+constexpr SoundStep SOUND_FINISH[] = {
+    {660U, 120U}, {0U, 50U}, {990U, 180U}};
+constexpr SoundStep SOUND_ABORT[] = {
+    {550U, 100U}, {0U, 40U}, {330U, 150U}};
+constexpr SoundStep SOUND_FAULT[] = {
+    {180U, 120U}, {0U, 80U}, {180U, 120U}, {0U, 80U}, {180U, 220U}};
 
 struct NodeInventoryEntry {
   uint8_t address;
   lp_identity_register_t identity;
   uint16_t bootCounter;
   uint16_t eventCounter;
+  uint16_t statusFlags;
   bool baselineValid;
   bool available;
 };
@@ -56,6 +87,20 @@ SensorConfigValues lastSensorConfig{240U, 16U, 30U, 500U};
 bool pendingSensorConfig = false;
 char sensorConfigInput[48]{};
 uint8_t sensorConfigInputLength = 0U;
+lp_game_engine_t game{};
+bool pendingPlayerName = false;
+char playerInput[LP_GAME_PLAYER_NAME_BYTES + 1U]{};
+uint8_t playerInputLength = 0U;
+uint32_t monotonicMicrosLow = 0U;
+uint64_t monotonicMicrosHigh = 0U;
+uint64_t fuGameTimestampUs = 0U;
+bool startAcceptanceEnabled = false;
+bool startClearTimerActive = false;
+uint32_t startClearSinceMs = 0U;
+const SoundStep *activeSound = nullptr;
+uint8_t activeSoundLength = 0U;
+uint8_t activeSoundStep = 0U;
+uint32_t soundStepStartedMs = 0U;
 
 enum class IdentityReadResult : uint8_t {
   OK,
@@ -117,11 +162,68 @@ const char *roleName(uint8_t role) {
   }
 }
 
+void stopSpeakerTone(void) {
+  pwm_set_enabled(pwm_gpio_to_slice_num(PIN_SPEAKER), false);
+  pinMode(PIN_SPEAKER, OUTPUT);
+  digitalWrite(PIN_SPEAKER, LOW);
+}
+
+void startSpeakerTone(uint16_t frequencyHz) {
+  constexpr uint16_t PWM_TOP = 4095U;
+  const uint slice = pwm_gpio_to_slice_num(PIN_SPEAKER);
+  const uint channel = pwm_gpio_to_channel(PIN_SPEAKER);
+  const float divider =
+      static_cast<float>(clock_get_hz(clk_sys)) /
+      (static_cast<float>(frequencyHz) * static_cast<float>(PWM_TOP + 1U));
+
+  gpio_set_function(PIN_SPEAKER, GPIO_FUNC_PWM);
+  pwm_config config = pwm_get_default_config();
+  pwm_config_set_clkdiv(&config, divider);
+  pwm_config_set_wrap(&config, PWM_TOP);
+  pwm_init(slice, &config, true);
+  pwm_set_chan_level(slice, channel, PWM_TOP / 2U);
+}
+
+void beginSoundStep(void) {
+  soundStepStartedMs = millis();
+  const uint16_t frequency = activeSound[activeSoundStep].frequencyHz;
+  if (frequency == 0U) {
+    stopSpeakerTone();
+  } else {
+    startSpeakerTone(frequency);
+  }
+}
+
+template <size_t Count>
+void playSound(const SoundStep (&sound)[Count]) {
+  activeSound = sound;
+  activeSoundLength = static_cast<uint8_t>(Count);
+  activeSoundStep = 0U;
+  beginSoundStep();
+}
+
+void updateSound(void) {
+  if (activeSound == nullptr ||
+      millis() - soundStepStartedMs <
+          activeSound[activeSoundStep].durationMs) {
+    return;
+  }
+  ++activeSoundStep;
+  if (activeSoundStep >= activeSoundLength) {
+    activeSound = nullptr;
+    activeSoundLength = 0U;
+    stopSpeakerTone();
+    return;
+  }
+  beginSoundStep();
+}
+
 void printIdentity(const lp_identity_register_t &identity);
 void printDiagnostics(void);
 void printNodeDiagnostics(const lp_diagnostics_register_t &diagnostics);
 bool discoverInventory(void);
 void pollInventory(void);
+void reportGameFault(const char *reason);
 
 void printInventory(void) {
   Serial.print("Inventory: ");
@@ -317,6 +419,7 @@ void addDiscoveredNode(uint8_t address,
   entry.identity = identity;
   entry.bootCounter = 0U;
   entry.eventCounter = 0U;
+  entry.statusFlags = 0U;
   entry.baselineValid = false;
   entry.available = true;
 }
@@ -422,6 +525,402 @@ bool sendCommand(uint8_t command, const uint8_t arguments[4],
     }
   }
   return false;
+}
+
+uint64_t monotonicMicros(void) {
+  const uint32_t current = micros();
+  if (current < monotonicMicrosLow) {
+    monotonicMicrosHigh += UINT64_C(1) << 32U;
+  }
+  monotonicMicrosLow = current;
+  return monotonicMicrosHigh | current;
+}
+
+uint64_t expandCapturedMicros(uint32_t captured) {
+  const uint64_t now = monotonicMicros();
+  const int32_t offset = static_cast<int32_t>(captured - (uint32_t)now);
+  return offset < 0 ? now - static_cast<uint32_t>(-offset)
+                    : now + static_cast<uint32_t>(offset);
+}
+
+bool sendCommandToNode(uint8_t address, uint8_t command,
+                       const uint8_t arguments[4]) {
+  const uint8_t selected = nodeAddress;
+  nodeAddress = address;
+  lp_command_result_register_t result{};
+  const bool received = sendCommand(command, arguments, result);
+  nodeAddress = selected;
+  if (!received || result.result != LP_RESULT_OK) {
+    Serial.print("Node command failed at 0x");
+    Serial.print(address, HEX);
+    Serial.print(", command=");
+    Serial.print(command);
+    if (received) {
+      Serial.print(", result=");
+      Serial.print(result.result);
+    }
+    Serial.println();
+    return false;
+  }
+  return true;
+}
+
+bool readStatusAt(uint8_t address, lp_fast_status_register_t &status) {
+  const uint8_t selected = nodeAddress;
+  nodeAddress = address;
+  bool valid = false;
+  for (uint8_t attempt = 0U; attempt < 3U && !valid; ++attempt) {
+    valid = readFastStatus(status);
+  }
+  nodeAddress = selected;
+  return valid;
+}
+
+void printGameResult(const lp_game_result_t &result) {
+  Serial.print("Attempt ");
+  Serial.print(result.player);
+  Serial.print(": status=");
+  Serial.print(result.status);
+  Serial.print(", raw=");
+  Serial.print(static_cast<unsigned long long>(result.raw_time_us / 1000U));
+  Serial.print(" ms, interruptions=");
+  Serial.print(result.interruptions);
+  Serial.print(", penalty=");
+  Serial.print(static_cast<unsigned long long>(result.penalty_time_us / 1000U));
+  Serial.print(" ms, score=");
+  Serial.print(static_cast<unsigned long long>(result.score_time_us / 1000U));
+  Serial.println(" ms");
+}
+
+void printGameStatus(void) {
+  Serial.print("Game state: ");
+  Serial.println(lp_game_state_name(game.state));
+  Serial.print("Current player: ");
+  Serial.println(game.current_player[0] != '\0' ? game.current_player : "-");
+  if (game.state == LP_GAME_WAIT_START) {
+    Serial.print("Start acceptance: ");
+    Serial.println(startAcceptanceEnabled ? "enabled" : "waiting for clear beams");
+  }
+  Serial.print("Interruptions: ");
+  Serial.println(game.interruptions);
+  if (game.state == LP_GAME_WAIT_FINISH) {
+    const uint64_t elapsedUs = monotonicMicros() - game.start_us;
+    const uint64_t scoreUs = elapsedUs +
+        (uint64_t)game.interruptions * game.settings.penalty_ms * 1000U;
+    Serial.print("Live raw/score: ");
+    Serial.print(static_cast<unsigned long long>(elapsedUs / 1000U));
+    Serial.print('/');
+    Serial.print(static_cast<unsigned long long>(scoreUs / 1000U));
+    Serial.println(" ms");
+  }
+}
+
+bool setAllNodeModes(uint8_t mode) {
+  const uint8_t arguments[4] = {mode, 0U, 0U, 0U};
+  bool success = true;
+  for (uint8_t index = 0U; index < inventoryCount; ++index) {
+    if (!sendCommandToNode(inventory[index].address, LP_COMMAND_SET_MODE,
+                           arguments)) {
+      success = false;
+    }
+  }
+  return success;
+}
+
+bool setLaserNodeModes(uint8_t mode) {
+  const uint8_t arguments[4] = {mode, 0U, 0U, 0U};
+  bool success = true;
+  for (uint8_t index = 0U; index < inventoryCount; ++index) {
+    if (inventory[index].identity.role == LP_ROLE_LASER &&
+        !sendCommandToNode(inventory[index].address, LP_COMMAND_SET_MODE,
+                           arguments)) {
+      success = false;
+    }
+  }
+  return success;
+}
+
+bool setButtonLedGuidance(uint8_t startState, uint8_t finishState) {
+  bool success = true;
+  for (uint8_t index = 0U; index < inventoryCount; ++index) {
+    const uint8_t role = inventory[index].identity.role;
+    if (role != LP_ROLE_START && role != LP_ROLE_FINISH) {
+      continue;
+    }
+    const uint8_t state =
+        role == LP_ROLE_START ? startState : finishState;
+    const uint8_t arguments[4] = {state, 0U, 0U, 0U};
+    if (!sendCommandToNode(inventory[index].address,
+                           LP_COMMAND_SET_BUTTON_LED, arguments)) {
+      success = false;
+    }
+  }
+  return success;
+}
+
+bool cachedLasersClear(void) {
+  for (uint8_t index = 0U; index < inventoryCount; ++index) {
+    if (inventory[index].identity.role == LP_ROLE_LASER &&
+        (!inventory[index].available ||
+         (inventory[index].statusFlags & LP_STATUS_INPUT_ACTIVE) != 0U)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool inventoryReadyForGame(bool requireClearBeams) {
+  if (!validateInventory()) {
+    return false;
+  }
+  uint8_t lasers = 0U;
+  bool ready = true;
+  for (uint8_t index = 0U; index < inventoryCount; ++index) {
+    const NodeInventoryEntry &entry = inventory[index];
+    lp_fast_status_register_t status{};
+    if (!readStatusAt(entry.address, status)) {
+      Serial.print("GAME PREPARATION: node unavailable at 0x");
+      Serial.println(entry.address, HEX);
+      ready = false;
+      continue;
+    }
+    const uint16_t flags = lp_u16_decode(status.status_flags);
+    if ((flags & (LP_STATUS_CONFIG_VALID | LP_STATUS_COMMISSIONED)) !=
+        (LP_STATUS_CONFIG_VALID | LP_STATUS_COMMISSIONED)) {
+      Serial.print("GAME PREPARATION: invalid node configuration at 0x");
+      Serial.println(entry.address, HEX);
+      ready = false;
+    }
+    if (entry.identity.role == LP_ROLE_LASER) {
+      ++lasers;
+      if (requireClearBeams && (flags & LP_STATUS_INPUT_ACTIVE) != 0U) {
+        Serial.print("GAME PREPARATION: broken laser at 0x");
+        Serial.println(entry.address, HEX);
+        ready = false;
+      }
+    }
+  }
+  if (lasers == 0U) {
+    Serial.println("GAME PREPARATION: at least one laser node is required");
+    ready = false;
+  }
+  return ready;
+}
+
+bool resetAndVerifyAllCounters(void) {
+  const uint16_t token = static_cast<uint16_t>(millis());
+  const uint8_t arguments[4] = {
+      static_cast<uint8_t>(token), static_cast<uint8_t>(token >> 8U), 0U, 0U};
+  for (uint8_t index = 0U; index < inventoryCount; ++index) {
+    if (!sendCommandToNode(inventory[index].address, LP_COMMAND_RESET_COUNTER,
+                           arguments)) {
+      return false;
+    }
+    lp_fast_status_register_t status{};
+    if (!readStatusAt(inventory[index].address, status) ||
+        lp_u16_decode(status.event_counter) != 0U) {
+      Serial.print("GAME PREPARATION: counter reset not verified at 0x");
+      Serial.println(inventory[index].address, HEX);
+      return false;
+    }
+    inventory[index].bootCounter = lp_u16_decode(status.boot_counter);
+    inventory[index].eventCounter = 0U;
+    inventory[index].baselineValid = true;
+    inventory[index].available = true;
+  }
+  return true;
+}
+
+bool allLaserCountersZero(void) {
+  bool zero = true;
+  for (uint8_t index = 0U; index < inventoryCount; ++index) {
+    if (inventory[index].identity.role != LP_ROLE_LASER) {
+      continue;
+    }
+    lp_fast_status_register_t status{};
+    if (!readStatusAt(inventory[index].address, status) ||
+        lp_u16_decode(status.event_counter) != 0U) {
+      Serial.print("GAME PREPARATION: laser counter is not zero at 0x");
+      Serial.println(inventory[index].address, HEX);
+      zero = false;
+    }
+  }
+  return zero;
+}
+
+void enterGameReady(void) {
+  lp_game_enter_setup(&game);
+  if (!discoverInventory() || !inventoryReadyForGame(false)) {
+    (void)lp_game_enter_game(&game, false);
+    playSound(SOUND_FAULT);
+    Serial.println("Game readiness failed; state is FAULT");
+    return;
+  }
+  if (!setAllNodeModes(LP_MODE_GAME) ||
+      !setButtonLedGuidance(LP_BUTTON_LED_STANDBY,
+                            LP_BUTTON_LED_STANDBY)) {
+    (void)lp_game_enter_game(&game, false);
+    playSound(SOUND_FAULT);
+    Serial.println("Game readiness failed while entering GAME mode");
+    return;
+  }
+  (void)lp_game_enter_game(&game, true);
+  playSound(SOUND_WAIT_PLAYER);
+  Serial.println("Game is waiting for a player name; use jNAME");
+}
+
+void armPlayer(const char *player) {
+  if (game.state != LP_GAME_WAIT_PLAYER) {
+    Serial.println("Cannot accept player: game is not waiting for a name");
+    return;
+  }
+  bool nonBlank = false;
+  for (const char *character = player; *character != '\0'; ++character) {
+    if (*character != ' ' && *character != '\t') {
+      nonBlank = true;
+    }
+  }
+  if (!nonBlank) {
+    Serial.println("Cannot arm player: name is blank");
+    return;
+  }
+  const lp_game_action_result_t result = lp_game_set_player(&game, player);
+  if (result != LP_GAME_OK) {
+    Serial.print("Cannot accept player, result=");
+    Serial.println(result);
+    return;
+  }
+  if (!setLaserNodeModes(LP_MODE_SETUP) || !resetAndVerifyAllCounters() ||
+      !setLaserNodeModes(LP_MODE_GAME) ||
+      !setButtonLedGuidance(LP_BUTTON_LED_STANDBY,
+                            LP_BUTTON_LED_STANDBY)) {
+    lp_game_fault(&game, monotonicMicros());
+    (void)setAllNodeModes(LP_MODE_SETUP);
+    playSound(SOUND_FAULT);
+    Serial.println("Player preparation failed; game entered FAULT");
+    return;
+  }
+  startAcceptanceEnabled = inventoryReadyForGame(true) && allLaserCountersZero();
+  startClearTimerActive = false;
+  const uint8_t startGuidance = startAcceptanceEnabled
+                                    ? LP_BUTTON_LED_READY
+                                    : LP_BUTTON_LED_BLOCKED;
+  if (!setButtonLedGuidance(startGuidance, LP_BUTTON_LED_STANDBY)) {
+    reportGameFault("could not update Start-button indication");
+    return;
+  }
+  Serial.print("Waiting for Start: ");
+  Serial.println(game.current_player);
+  playSound(SOUND_WAIT_START);
+  if (!startAcceptanceEnabled) {
+    startClearTimerActive = true;
+    startClearSinceMs = millis();
+    playSound(SOUND_START_BLOCKED);
+    Serial.println(
+        "Start disabled; clear interval is held at zero while a laser is blocked");
+  }
+}
+
+void finishAndAdvance(void) {
+  printGameResult(game.last_result);
+  startAcceptanceEnabled = false;
+  startClearTimerActive = false;
+  (void)setButtonLedGuidance(LP_BUTTON_LED_STANDBY,
+                             LP_BUTTON_LED_STANDBY);
+  Serial.println("Waiting for next player name");
+}
+
+void disableStartUntilLasersClear(void) {
+  if (game.state != LP_GAME_WAIT_START || !startAcceptanceEnabled) {
+    return;
+  }
+  startAcceptanceEnabled = false;
+  startClearTimerActive = false;
+  (void)setButtonLedGuidance(LP_BUTTON_LED_BLOCKED,
+                             LP_BUTTON_LED_STANDBY);
+  playSound(SOUND_START_BLOCKED);
+  Serial.println();
+  Serial.println(
+      "Start disabled; three-second clear interval started or reset");
+}
+
+void updateStartReadiness(void) {
+  if (game.state != LP_GAME_WAIT_START || startAcceptanceEnabled) {
+    startClearTimerActive = false;
+    return;
+  }
+  const uint32_t nowMs = millis();
+  if (!startClearTimerActive) {
+    startClearTimerActive = true;
+    startClearSinceMs = nowMs;
+  }
+  if (!cachedLasersClear()) {
+    // A continuously broken beam holds the retriggerable interval at zero.
+    startClearSinceMs = nowMs;
+    return;
+  }
+  if (nowMs - startClearSinceMs < START_CLEAR_INTERVAL_MS) {
+    return;
+  }
+
+  startClearTimerActive = false;
+  if (!setLaserNodeModes(LP_MODE_SETUP) || !resetAndVerifyAllCounters() ||
+      !inventoryReadyForGame(true) || !setLaserNodeModes(LP_MODE_GAME) ||
+      !allLaserCountersZero() ||
+      !setButtonLedGuidance(LP_BUTTON_LED_READY,
+                            LP_BUTTON_LED_STANDBY)) {
+    reportGameFault("could not re-enable Start after the clear interval");
+    return;
+  }
+  startAcceptanceEnabled = true;
+  playSound(SOUND_START_REENABLED);
+  Serial.println();
+  Serial.println("Lasers remained clear for 3 seconds; Start is enabled");
+}
+
+void reportGameFault(const char *reason) {
+  const bool attemptActive = game.state == LP_GAME_WAIT_START ||
+                             game.state == LP_GAME_WAIT_FINISH;
+  if (game.state != LP_GAME_WAIT_PLAYER && !attemptActive) {
+    return;
+  }
+  Serial.println();
+  Serial.print("GAME FAULT: ");
+  Serial.println(reason);
+  lp_game_fault(&game, monotonicMicros());
+  startAcceptanceEnabled = false;
+  startClearTimerActive = false;
+  (void)setButtonLedGuidance(LP_BUTTON_LED_STANDBY,
+                             LP_BUTTON_LED_STANDBY);
+  playSound(SOUND_FAULT);
+  if (attemptActive) {
+    printGameResult(game.last_result);
+  }
+}
+
+void abortGame(void) {
+  const lp_game_action_result_t result =
+      lp_game_abort(&game, monotonicMicros());
+  if (result != LP_GAME_OK) {
+    Serial.println("No player preparation or active run to abort");
+    return;
+  }
+  playSound(SOUND_ABORT);
+  finishAndAdvance();
+}
+
+void returnGameToSetup(void) {
+  if (game.state == LP_GAME_WAIT_START || game.state == LP_GAME_WAIT_FINISH) {
+    if (lp_game_abort(&game, monotonicMicros()) == LP_GAME_OK) {
+      printGameResult(game.last_result);
+    }
+  }
+  (void)setAllNodeModes(LP_MODE_SETUP);
+  lp_game_enter_setup(&game);
+  startAcceptanceEnabled = false;
+  startClearTimerActive = false;
+  playSound(SOUND_SETUP);
+  Serial.println("Game returned to SETUP");
 }
 
 void saveStagedConfiguration(void) {
@@ -743,6 +1242,7 @@ uint16_t pollInventoryEntry(uint8_t index, bool dueToFu) {
       Serial.print(entry.address, HEX);
       Serial.print(" unavailable: ");
       Serial.println(readResultName(lastReadResult));
+      reportGameFault("required node became unavailable");
     }
     entry.available = false;
     nodeAddress = selectedAddress;
@@ -758,6 +1258,26 @@ uint16_t pollInventoryEntry(uint8_t index, bool dueToFu) {
   entry.available = true;
   const uint16_t bootCounter = lp_u16_decode(status.boot_counter);
   const uint16_t eventCounter = lp_u16_decode(status.event_counter);
+  const uint16_t flags = lp_u16_decode(status.status_flags);
+  entry.statusFlags = flags;
+  if (entry.identity.role == LP_ROLE_LASER &&
+      game.state == LP_GAME_WAIT_START &&
+      (flags & LP_STATUS_INPUT_ACTIVE) != 0U) {
+    disableStartUntilLasersClear();
+  }
+  if ((game.state == LP_GAME_WAIT_PLAYER ||
+       game.state == LP_GAME_WAIT_START ||
+       game.state == LP_GAME_WAIT_FINISH) &&
+      (flags & (LP_STATUS_CONFIG_VALID | LP_STATUS_COMMISSIONED)) !=
+          (LP_STATUS_CONFIG_VALID | LP_STATUS_COMMISSIONED)) {
+    reportGameFault("node reported invalid configuration");
+  }
+  if ((game.state == LP_GAME_WAIT_PLAYER ||
+       game.state == LP_GAME_WAIT_START ||
+       game.state == LP_GAME_WAIT_FINISH) &&
+      (flags & LP_STATUS_GAME_MODE) == 0U) {
+    reportGameFault("node left game mode");
+  }
   if (!entry.baselineValid) {
     entry.bootCounter = bootCounter;
     entry.eventCounter = eventCounter;
@@ -773,6 +1293,7 @@ uint16_t pollInventoryEntry(uint8_t index, bool dueToFu) {
     Serial.print(entry.bootCounter);
     Serial.print(" -> ");
     Serial.println(bootCounter);
+    reportGameFault("node restarted");
     entry.bootCounter = bootCounter;
     entry.eventCounter = eventCounter;
     nodeAddress = selectedAddress;
@@ -782,6 +1303,13 @@ uint16_t pollInventoryEntry(uint8_t index, bool dueToFu) {
   const uint16_t difference =
       static_cast<uint16_t>(eventCounter - entry.eventCounter);
   if (difference != 0U) {
+    const bool beginsGameEvent =
+        !dueToFu && entry.identity.role == LP_ROLE_LASER &&
+        (game.state == LP_GAME_WAIT_START ||
+         game.state == LP_GAME_WAIT_FINISH);
+    if (beginsGameEvent) {
+      Serial.println();
+    }
     Serial.print(dueToFu ? "FU source " : "Periodic event ");
     Serial.print(roleName(entry.identity.role));
     Serial.print(" node 0x");
@@ -793,7 +1321,23 @@ uint16_t pollInventoryEntry(uint8_t index, bool dueToFu) {
     Serial.println(')');
     if (!dueToFu && (entry.identity.role == LP_ROLE_START ||
                      entry.identity.role == LP_ROLE_FINISH)) {
-      Serial.println("  WARNING: button counter advanced without captured FU edge");
+      playSound(SOUND_INVALID_BUTTON);
+      Serial.println("  Button event ignored because no matching FU edge was captured");
+    } else if (!dueToFu && entry.identity.role == LP_ROLE_LASER) {
+      if (game.state == LP_GAME_WAIT_FINISH) {
+        (void)lp_game_add_interruptions(&game, difference);
+        playSound(SOUND_INTERRUPTION);
+        Serial.print("Game interruptions: ");
+        Serial.println(game.interruptions);
+      } else if (game.state == LP_GAME_WAIT_START) {
+        const bool startWasEnabled = startAcceptanceEnabled;
+        disableStartUntilLasersClear();
+        if (!startWasEnabled) {
+          startClearTimerActive = true;
+          startClearSinceMs = millis();
+          playSound(SOUND_START_BLOCKED);
+        }
+      }
     }
     entry.eventCounter = eventCounter;
   }
@@ -825,19 +1369,72 @@ void correlateFuEdge(void) {
   }
   fuCorrelationPending = false;
   uint8_t sources = 0U;
+  uint16_t startEvents = 0U;
+  uint16_t finishEvents = 0U;
   for (uint8_t index = 0U; index < inventoryCount; ++index) {
     const uint8_t role = inventory[index].identity.role;
     if (role != LP_ROLE_START && role != LP_ROLE_FINISH) {
       continue;
     }
-    if (pollInventoryEntry(index, true) != 0U) {
+    const uint16_t difference = pollInventoryEntry(index, true);
+    if (difference != 0U) {
       ++sources;
+      if (role == LP_ROLE_START) {
+        startEvents = difference;
+      } else {
+        finishEvents = difference;
+      }
     }
   }
   if (sources == 0U) {
     Serial.println("FU FAULT: no button counter advanced");
+    reportGameFault("FU edge had no matching button counter");
   } else if (sources > 1U) {
+    Serial.println();
     Serial.println("FU overlap: multiple button counters advanced");
+    playSound(SOUND_INVALID_BUTTON);
+  } else if (startEvents != 0U) {
+    Serial.println();
+    if (game.state != LP_GAME_WAIT_START) {
+      playSound(SOUND_INVALID_BUTTON);
+      Serial.println("Start event ignored: game is not waiting for Start");
+      return;
+    }
+    if (!startAcceptanceEnabled) {
+      playSound(SOUND_INVALID_BUTTON);
+      Serial.println("Start event ignored: lasers are not yet ready");
+      return;
+    }
+    const lp_game_action_result_t result =
+        lp_game_start(&game, fuGameTimestampUs, true);
+    if (result == LP_GAME_OK) {
+      startAcceptanceEnabled = false;
+      startClearTimerActive = false;
+      if (!setButtonLedGuidance(LP_BUTTON_LED_STANDBY,
+                                LP_BUTTON_LED_READY)) {
+        reportGameFault("could not enable Finish-button indication");
+        return;
+      }
+      playSound(SOUND_START);
+      Serial.print("Waiting for Finish: ");
+      Serial.println(game.current_player);
+    } else {
+      playSound(SOUND_INVALID_BUTTON);
+      Serial.print("Start event ignored, result=");
+      Serial.println(result);
+    }
+  } else if (finishEvents != 0U) {
+    Serial.println();
+    const lp_game_action_result_t result =
+        lp_game_finish(&game, fuGameTimestampUs);
+    if (result == LP_GAME_OK) {
+      playSound(SOUND_FINISH);
+      finishAndAdvance();
+    } else {
+      playSound(SOUND_INVALID_BUTTON);
+      Serial.print("Finish event ignored, result=");
+      Serial.println(result);
+    }
   }
 }
 
@@ -863,6 +1460,7 @@ void handleFuEdge(void) {
     Serial.println(" us");
     fuCorrelationPending = true;
     fuCorrelationDueMs = millis() + 15U;
+    fuGameTimestampUs = expandCapturedMicros(timestampUs);
   }
   if (rising) {
     Serial.print("FU low pulse: ");
@@ -1142,34 +1740,107 @@ bool consumePendingAddress(char value) {
   return true;
 }
 
+void beginPlayerEntry(void) {
+  pendingPlayerName = true;
+  playerInputLength = 0U;
+  Serial.println("Enter player name and press Return:");
+}
+
+bool consumePlayerEntry(char value) {
+  if (!pendingPlayerName) {
+    return false;
+  }
+  if (value == '\r' || value == '\n') {
+    pendingPlayerName = false;
+    playerInput[playerInputLength] = '\0';
+    armPlayer(playerInput);
+    return true;
+  }
+  if ((value == '\b' || value == 0x7F) && playerInputLength != 0U) {
+    --playerInputLength;
+    return true;
+  }
+  if (playerInputLength >= LP_GAME_PLAYER_NAME_BYTES) {
+    pendingPlayerName = false;
+    playerInputLength = 0U;
+    Serial.println("Player entry cancelled: maximum length is 32 bytes");
+    return true;
+  }
+  playerInput[playerInputLength++] = value;
+  return true;
+}
+
 void printHelp(void) {
   Serial.println("Commands:");
   Serial.println("  h       print this help");
-  Serial.println("  d       completely rescan and rebuild the inventory");
+  Serial.println("  d       completely rescan and rebuild inventory (SETUP)");
   Serial.println("  v       print the current inventory without rescanning");
   Serial.println("  pXX     select discovered node address 0xXX");
   Serial.println("  p<Enter> cycle to the next discovered node");
   Serial.println("  r       print details for the selected node");
-  Serial.println("  iXX     stage a laser at hexadecimal address 0xXX");
-  Serial.println("  aXX     stage a start node at hexadecimal address 0xXX");
-  Serial.println("  eXX     stage a finish node at hexadecimal address 0xXX");
-  Serial.println("  cV,V,V,V stage threshold,hysteresis,stable_ms,cooldown_ms");
+  Serial.println("  w       validate the bus and enter game mode");
+  Serial.println("  jNAME   submit the player name when requested");
+  Serial.println("  t       print game state and live score");
+  Serial.println("  b       abort player preparation or the active run");
+  Serial.println("  u       return the complete system to SETUP");
+  Serial.println("  iXX     stage a laser at address 0xXX (SETUP)");
+  Serial.println("  aXX     stage a start node at address 0xXX (SETUP)");
+  Serial.println("  eXX     stage a finish node at address 0xXX (SETUP)");
+  Serial.println("  cV,V,V,V stage sensor parameters (SETUP)");
   Serial.println("  c<Enter> reuse and stage the last sensor configuration");
-  Serial.println("  s       save and activate staged configuration");
+  Serial.println("  s       save and activate staged configuration (SETUP)");
   Serial.println("  l       insert blank lines into the serial log");
-  Serial.println("  g / u   switch selected node to game / setup mode");
+  Serial.println("  g       switch selected node to game mode (diagnostic)");
   Serial.println("  z       reset the selected node event counter");
   Serial.println("  n       identify the selected node for 4 seconds");
   Serial.println("  f       factory-reset and restart the selected node");
 }
 
+bool isSetupOnlyCommand(char command) {
+  switch (command) {
+    case 'i':
+    case 'I':
+    case 'a':
+    case 'A':
+    case 'e':
+    case 'E':
+    case 'c':
+    case 'C':
+    case 's':
+    case 'S':
+    case 'd':
+    case 'D':
+    case 'g':
+    case 'G':
+    case 'z':
+    case 'Z':
+    case 'n':
+    case 'N':
+    case 'f':
+    case 'F':
+      return true;
+    default:
+      return false;
+  }
+}
+
 void handleSerialInput(void) {
   while (Serial.available() != 0) {
     const char command = static_cast<char>(Serial.read());
+    if (consumePlayerEntry(command)) {
+      continue;
+    }
     if (consumeSensorConfig(command)) {
       continue;
     }
     if (consumePendingAddress(command)) {
+      continue;
+    }
+    if (isSetupOnlyCommand(command) && game.state != LP_GAME_SETUP) {
+      Serial.println();
+      Serial.print("Command '");
+      Serial.print(command);
+      Serial.println("' is available only in SETUP; use u first");
       continue;
     }
     if (command == 'h' || command == 'H') {
@@ -1178,6 +1849,26 @@ void handleSerialInput(void) {
     } else if (command == 'r' || command == 'R') {
       Serial.println();
       printDiagnostics();
+    } else if (command == 'w' || command == 'W') {
+      Serial.println();
+      if (game.state == LP_GAME_SETUP || game.state == LP_GAME_FAULT) {
+        enterGameReady();
+      } else {
+        Serial.println("Already in game mode; use u before starting setup again");
+      }
+    } else if (command == 'j' || command == 'J') {
+      Serial.println();
+      if (game.state == LP_GAME_WAIT_PLAYER) {
+        beginPlayerEntry();
+      } else {
+        Serial.println("Player names are accepted only in WAIT_PLAYER");
+      }
+    } else if (command == 't' || command == 'T') {
+      Serial.println();
+      printGameStatus();
+    } else if (command == 'b' || command == 'B') {
+      Serial.println();
+      abortGame();
     } else if (command == 'i' || command == 'I') {
       Serial.println();
       beginCommissioningAddress(LP_ROLE_LASER);
@@ -1211,7 +1902,7 @@ void handleSerialInput(void) {
       setNodeMode(LP_MODE_GAME);
     } else if (command == 'u' || command == 'U') {
       Serial.println();
-      setNodeMode(LP_MODE_SETUP);
+      returnGameToSetup();
     } else if (command == 'z' || command == 'Z') {
       Serial.println();
       resetNodeCounter();
@@ -1228,6 +1919,8 @@ void handleSerialInput(void) {
 }  // namespace
 
 void setup() {
+  pinMode(PIN_SPEAKER, OUTPUT);
+  digitalWrite(PIN_SPEAKER, LOW);
   pinMode(PIN_NODE_RESET, INPUT);
   pinMode(PIN_EVENT, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PIN_EVENT), onFuEdge, CHANGE);
@@ -1246,6 +1939,12 @@ void setup() {
 
   Wire.begin();
   Wire.setClock(SENSOR_BUS_FREQUENCY_HZ);
+  const lp_game_settings_t gameSettings = {
+      .penalty_ms = 5000U,
+      .maximum_run_ms = 10U * 60U * 1000U,
+  };
+  lp_game_init(&game, gameSettings);
+  (void)monotonicMicros();
   if (discoverNode()) {
     printInventory();
     (void)validateInventory();
@@ -1255,11 +1954,20 @@ void setup() {
 }
 
 void loop() {
+  const uint64_t nowUs = monotonicMicros();
   handleSerialInput();
+  updateSound();
   handleFuEdge();
   correlateFuEdge();
+  if (lp_game_tick(&game, nowUs)) {
+    Serial.println();
+    Serial.println("Maximum run time reached");
+    playSound(SOUND_ABORT);
+    finishAndAdvance();
+  }
   if (millis() - lastPollMs >= POLL_INTERVAL_MS) {
     lastPollMs = millis();
     pollInventory();
   }
+  updateStartReadiness();
 }

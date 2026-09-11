@@ -38,7 +38,7 @@ static lp_identity_register_t identity = {
     .protocol_major = LP_PROTOCOL_MAJOR,
     .protocol_minor = LP_PROTOCOL_MINOR,
     .firmware_major = 0U,
-    .firmware_minor = 1U,
+    .firmware_minor = 2U,
     .firmware_patch = 0U,
     .role = LP_ROLE_UNCONFIGURED,
     .address = LP_ADDRESS_COMMISSIONING,
@@ -78,10 +78,12 @@ static uint8_t button_release_samples;
 static uint16_t button_pressed_samples;
 static uint8_t fu_pulse_active;
 static uint8_t fu_pulse_started_tick;
+static uint8_t button_led_state = LP_BUTTON_LED_STANDBY;
 
 typedef enum {
   LED_STATE_UNINITIALIZED,
   LED_STATE_OFF,
+  LED_STATE_STANDBY,
   LED_STATE_STEADY,
   LED_STATE_SLOW,
   LED_STATE_NORMAL,
@@ -146,6 +148,16 @@ static void status_led_set(led_state_t next) {
     return;
   }
 
+  if (next == LED_STATE_STANDBY) {
+    // Fast hardware PWM: approximately 1.25 kHz with 5% LED-on duty cycle.
+    OCR1C = 99U;
+    OCR1A = 94U;
+    GTCCR = 0U;
+    PORTB &= (uint8_t)~_BV(PB1);
+    TCCR1 = _BV(PWM1A) | _BV(COM1A1) | _BV(COM1A0) | _BV(CS12);
+    return;
+  }
+
   if (next == LED_STATE_SLOW) {
     OCR1C = 243U;
     OCR1A = 121U;
@@ -173,6 +185,12 @@ static void update_status_led(uint8_t beam_broken) {
                        ? LED_STATE_SLOW
                        : LED_STATE_OFF);
   } else if (beam_broken && identity.role == LP_ROLE_LASER) {
+    status_led_set(LED_STATE_SLOW);
+  } else if (role_is_button() && operating_mode == LP_MODE_GAME &&
+             button_led_state == LP_BUTTON_LED_STANDBY) {
+    status_led_set(LED_STATE_STANDBY);
+  } else if (role_is_button() && operating_mode == LP_MODE_GAME &&
+             button_led_state == LP_BUTTON_LED_BLOCKED) {
     status_led_set(LED_STATE_SLOW);
   } else {
     status_led_set(LED_STATE_STEADY);
@@ -414,9 +432,31 @@ static void execute_command(const lp_command_register_t *command) {
                                LP_RESULT_WRONG_MODE, 0U);
       } else {
         operating_mode = command->arguments[0];
+        if (operating_mode == LP_MODE_SETUP) {
+          button_led_state = LP_BUTTON_LED_STANDBY;
+        }
         identify_samples_remaining = 0U;
         prepare_command_result(command->sequence, command->command,
                                LP_RESULT_OK, operating_mode);
+      }
+      break;
+
+    case LP_COMMAND_SET_BUTTON_LED:
+      if (!role_is_button()) {
+        prepare_command_result(command->sequence, command->command,
+                               LP_RESULT_WRONG_ROLE, 0U);
+      } else if (operating_mode != LP_MODE_GAME) {
+        prepare_command_result(command->sequence, command->command,
+                               LP_RESULT_WRONG_MODE, 0U);
+      } else if (command->arguments[0] > LP_BUTTON_LED_BLOCKED ||
+                 command->arguments[1] != 0U || command->arguments[2] != 0U ||
+                 command->arguments[3] != 0U) {
+        prepare_command_result(command->sequence, command->command,
+                               LP_RESULT_INVALID_VALUE, 0U);
+      } else {
+        button_led_state = command->arguments[0];
+        prepare_command_result(command->sequence, command->command,
+                               LP_RESULT_OK, button_led_state);
       }
       break;
 
@@ -430,7 +470,7 @@ static void execute_command(const lp_command_register_t *command) {
       break;
 
     case LP_COMMAND_RESET_COUNTER:
-      if (operating_mode != LP_MODE_SETUP) {
+      if (operating_mode != LP_MODE_SETUP && !role_is_button()) {
         prepare_command_result(command->sequence, command->command,
                                LP_RESULT_WRONG_MODE, 0U);
       } else if (command->arguments[2] != 0U ||

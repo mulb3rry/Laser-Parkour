@@ -26,23 +26,26 @@ reference, but is not the basis of the new implementation.
 
 ## Game Rules
 
-1. An operator enters or queues a player name in the web interface.
-2. A run can be armed only when:
+1. The operator deliberately switches the controller from setup mode to game
+   mode.
+2. The controller waits for one player name. There is no player queue in the
+   initial implementation.
+3. A run can wait for Start only when:
    - setup has been completed;
    - exactly one start and one finish node are present;
    - at least one laser node is present;
    - every expected node is responding; and
    - every laser beam is currently unbroken.
-3. Before accepting a start, the controller resets every node event counter,
+4. Before accepting a start, the controller resets every node event counter,
    verifies that all laser counters are zero, and records the button-counter
    baselines.
-4. The player presses the start button. The controller timestamps the event and
+5. The player presses the start button. The controller timestamps the event and
    starts the run.
-5. During the run, each accepted laser interruption increments the interruption
+6. During the run, each accepted laser interruption increments the interruption
    count and produces audible feedback.
-6. The player presses the finish button. The controller timestamps the event,
+7. The player presses the finish button. The controller timestamps the event,
    calculates the score, stores the result, and updates the web interface.
-7. The next queued player may then start when all beams are unbroken again.
+8. The controller returns directly to waiting for the next player name.
 
 The score is calculated as:
 
@@ -67,7 +70,7 @@ controller:
 The penalty is configurable in the web setup view. A changed value applies to
 subsequent runs and does not recalculate stored scores.
 
-An operator can abort an armed or running attempt. An aborted attempt is shown
+An operator can abort player preparation or an active attempt. An aborted attempt is shown
 in recent activity but is not included in the top-ten scoreboard. A run that
 exceeds the maximum run time is automatically aborted.
 
@@ -86,27 +89,57 @@ configuration, current input state, and event counters.
 
 | State | Description | Allowed transitions |
 |---|---|---|
-| `BOOT` | Initialize hardware and load persistent data | `SETUP`, `FAULT` |
-| `SETUP` | Discover, commission, calibrate, and test nodes | `READY`, `FAULT` |
-| `READY` | Game configured; waiting for a player | `ARMED`, `SETUP`, `FAULT` |
-| `ARMED` | A current player exists; waiting for start | `RUNNING`, `READY`, `FAULT` |
-| `RUNNING` | Timer and interruption counting active | `FINISHED`, `ABORTED`, `FAULT` |
-| `FINISHED` | Result calculated and committed | `READY`, `ARMED` |
-| `ABORTED` | Attempt ended without a score | `READY`, `ARMED` |
-| `FAULT` | Required hardware is missing or inconsistent | `SETUP` |
+| `SETUP` | Discover, commission, calibrate, and test nodes | `WAIT_PLAYER`, `FAULT` |
+| `WAIT_PLAYER` | Game mode; waiting for one player name | `WAIT_START`, `SETUP`, `FAULT` |
+| `WAIT_START` | Player prepared; waiting for an enabled Start button | `WAIT_FINISH`, `WAIT_PLAYER`, `SETUP`, `FAULT` |
+| `WAIT_FINISH` | Timer and interruption counting active | `WAIT_PLAYER`, `SETUP`, `FAULT` |
+| `FAULT` | Required hardware is missing or inconsistent | `SETUP`, or `WAIT_PLAYER` after validation |
 
-If another player has already been queued when a run finishes, that player
-becomes the current player and the state returns to `ARMED`; otherwise it
-returns to `READY`. A start is accepted only in `ARMED` and only if all beams
-are clear at that instant.
+```mermaid
+stateDiagram-v2
+    [*] --> SETUP
+    SETUP --> WAIT_PLAYER: enter game mode / validation succeeds
+    SETUP --> FAULT: validation fails
+    WAIT_PLAYER --> WAIT_START: player name accepted
+    WAIT_START --> WAIT_FINISH: enabled Start event
+    WAIT_START --> WAIT_PLAYER: operator abort
+    WAIT_FINISH --> WAIT_PLAYER: Finish, abort, or timeout
+    WAIT_PLAYER --> SETUP: return to setup
+    WAIT_START --> SETUP: return to setup
+    WAIT_FINISH --> SETUP: return to setup
+    WAIT_START --> FAULT: required hardware fault
+    WAIT_FINISH --> FAULT: required hardware fault
+    FAULT --> SETUP: recovery
+```
 
-Entering `ARMED` includes a preparation step: the controller waits until all
+Submitting a player name enters `WAIT_START`. A Start event is accepted only
+in `WAIT_START`, while Start is enabled, and while all beams are clear. A
+Finish event is accepted only in `WAIT_FINISH`. All other Start and Finish
+events are ignored and logged without changing state.
+
+Entering `WAIT_START` includes a preparation step: the controller waits until all
 beams are clear, sends `Reset counters` to every node, reads the counters back,
 and enables the start event only after the reset is verified. Laser
 interruptions between rounds are therefore discarded and never contribute to
 the next player's score. If a laser event occurs after this reset but before
-the start button is pressed, the controller disables start acceptance, waits
-for all beams to be clear, and repeats the reset procedure.
+the start button is pressed, the controller immediately dims and disables
+Start and begins or resets a three-second clear interval. While any laser
+remains broken, the interval is continuously held at zero. Every later
+interruption resets it again. Start presses are ignored until every laser has
+remained clear continuously for three seconds. The controller then repeats and verifies the
+counter reset automatically and re-enables Start; no extra Start press is
+consumed by preparation.
+
+Laser events affect the score only in `WAIT_FINISH`. They are ignored in
+`SETUP`, `WAIT_PLAYER`, and `WAIT_START` (apart from the Start-readiness rule
+above). A valid Finish or an operator abort returns directly to `WAIT_PLAYER`.
+
+Commissioning, configuration, saving, rescanning, Identify, factory reset,
+manual counter reset, and diagnostic mode-change commands are accepted only in
+`SETUP`. The controller rejects them before prompting for parameters or sending
+anything over the bus. Read-only inventory and node-detail commands remain
+available in game mode. Entering a player name is accepted only in
+`WAIT_PLAYER`, and the enter-game command cannot restart an active game.
 
 At the accepted start timestamp, every laser event counter is zero. The start
 button's own counter then contains the new start event; it is compared with the
@@ -265,14 +298,31 @@ The node uses these indications, in descending priority:
 `IDENTIFY` lasts four seconds and temporarily overrides every other indication.
 Afterward, the LED immediately returns to the highest-priority active state.
 Uncommissioned and error states deliberately use the same pattern; their exact
-cause is available through the controller and web UI. Commissioned nodes use
-the same normal and broken-beam indications in `SETUP` and `GAME`: steady on
-when healthy and clear, and slow blinking for a broken laser. Identify remains
-available only in setup mode.
+cause is available through the controller and web UI. A commissioned laser is
+steady on when healthy and clear and slowly blinks for a broken beam. Identify
+remains available only in setup mode.
 
-A commissioned start/finish node is steadily on while its button is released.
-Pressing the button turns the LED off immediately. Releasing it turns the LED
-back on. If it remains pressed for three seconds, the node changes from off to
+A commissioned start/finish node is steadily on in setup mode. In game mode,
+the controller selects one of three player-guidance indications:
+
+| Controller state | Start LED | Finish LED |
+|---|---|---|
+| `WAIT_PLAYER` | 5% steady glow | 5% steady glow |
+| `WAIT_START`, laser blocked | Regular 1 Hz blink | 5% steady glow |
+| `WAIT_START`, Start enabled | 100% steady on | 5% steady glow |
+| `WAIT_FINISH` | 5% steady glow | 100% steady on |
+
+The standby glow uses approximately 1.25 kHz hardware PWM, so it appears
+steady. It shows that an inactive button node is powered while remaining
+clearly subordinate to the active button. The simple instruction to a player
+is: **press the brightly illuminated button; if Start is blinking, wait until
+it remains brightly and continuously on.** The initial 5% duty cycle must be
+confirmed under the expected ambient lighting and may be adjusted after a
+physical test.
+
+Pressing a button turns its LED off immediately. Releasing it returns to the
+guidance pattern selected by the controller. If it remains pressed for three
+seconds, the node changes from off to
 the slow 1 Hz hardware blink and continues blinking until release. This visual
 behavior does not delay the accepted edge, extend `FU`, or change debounce.
 
@@ -339,7 +389,7 @@ The Pico W firmware is responsible for:
 - node discovery, commissioning, configuration, and health monitoring;
 - the authoritative game state machine;
 - timestamps and score calculation;
-- player queue, recent results, and top-ten scoreboard;
+- current-player handling, recent results, and top-ten scoreboard;
 - persistent configuration and completed results;
 - Wi-Fi access point and web server;
 - LCD, encoder, RGB LED, and speaker feedback; and
@@ -436,7 +486,7 @@ The setup view must provide:
 The game view must show:
 
 - connection and system state;
-- current player and a next-player input/queue;
+- a player-name input while the controller is in `WAIT_PLAYER`;
 - live raw time, interruption count, penalty, and score time;
 - the top ten scores;
 - the ten most recent attempts;
@@ -444,10 +494,9 @@ The game view must show:
 - node or beam faults; and
 - operator controls to abort the run and return to setup.
 
-Exactly one next-player slot is provided while a run is active; there is no
-larger queue. A new name may replace the queued name only after explicit
-operator confirmation. Duplicate player names are allowed. Blank names are
-rejected.
+There is no player queue in the initial implementation. A player name is
+accepted only in `WAIT_PLAYER`; names submitted during an active attempt are
+rejected. Duplicate player names are allowed and blank names are rejected.
 
 The browser receives state updates without reloading the page. Server-Sent
 Events are preferred for controller-to-browser updates because the primary data
@@ -494,18 +543,32 @@ field order must be evaluated on the physical LCD.
 
 ### Sounds
 
-The speaker provides three distinct non-blocking sound patterns:
+The speaker provides distinct non-blocking cues for game-state transitions and
+accepted laser interruptions. These are the initial values for listening tests:
 
-| Event | Sound character |
+| Transition or event | Initial sound pattern |
 |---|---|
-| Start button accepted | Short, positive start confirmation |
-| Laser interruption accepted | Short warning tone, clearly unlike start |
-| Finish button accepted | Longer success pattern, clearly unlike both others |
+| Enter `SETUP` | 440 Hz for 100 ms |
+| Enter `WAIT_PLAYER` from setup | 660 Hz for 90 ms |
+| Enter `WAIT_START` | 660 Hz for 80 ms, 40 ms pause, 880 Hz for 100 ms |
+| Enter `WAIT_FINISH` / Start accepted | 880 Hz for 150 ms |
+| Laser interruption accepted | 220 Hz for 250 ms |
+| Start or Finish pressed when not accepted | Two short 300 Hz rejection tones |
+| Laser blocks Start and starts/resets the clear interval | 330 Hz followed by 220 Hz warning |
+| Three-second interval completes; Start enabled | 660 Hz followed by 880 Hz |
+| Finish accepted and return to `WAIT_PLAYER` | 660 Hz for 120 ms, 50 ms pause, 990 Hz for 180 ms |
+| Abort and return to `WAIT_PLAYER` | 550 Hz for 100 ms, 40 ms pause, 330 Hz for 150 ms |
+| Enter `FAULT` | Three 180 Hz pulses |
+
+Ignored laser changes outside their applicable game state remain silent. An
+ignored Start or Finish event produces the rejection cue without changing the
+game state. A new cue replaces a cue still playing, so current events are never
+delayed behind an audio queue.
 
 Sounds are generated with Pico PWM hardware. Playback must not block timestamp
-capture, bus polling, the game state machine, or the web server. Initial
-frequencies, durations, pauses, and repetition counts will be selected during
-implementation and finalized by listening tests on the actual speaker.
+capture, bus polling, the game state machine, or the web server. The initial
+frequencies, durations, and pauses must be finalized by listening tests on the
+actual speaker.
 
 ### Controller RGB LED
 
@@ -567,7 +630,7 @@ Firmware/
     src/               Production entry point
     smoke/             Preserved combined hardware smoke test
     drivers/           Pico hardware access
-    game/              State machine, scoring, and player queue
+    game/              State machine, scoring, and player handling
     bus/               Discovery and node communication
     storage/           Versioned persistent data
     web/               HTTP/SSE server and static assets
@@ -728,7 +791,7 @@ restarts, invalid inventories, and `FU` faults are detected.
 
 ### 2. Game Engine
 
-- Implement the controller state machine, player queue, timestamp handling,
+- Implement the controller state machine, player-name handling, timestamp handling,
   between-round counter reset, scoring, aborts, timeouts, and fault transitions.
 - Add host unit tests for every state transition and scoring edge case.
 - Add speaker game-event feedback and RGB system-health indication.

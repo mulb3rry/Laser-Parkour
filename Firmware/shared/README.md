@@ -9,6 +9,6 @@ Run the native tests from this directory with:
 pio test -e native
 ```
 
-The tests verify exact register sizes, little-endian conversion, the standard
-CRC-8/SMBUS check value, the documented register test vector, and basic
-corruption detection.
+The tests verify exact register sizes, little-endian conversion, CRC behavior,
+and the portable game engine's state transitions, scoring, abort,
+timeout, and fault behavior.
