@@ -2,6 +2,8 @@
 #include <Wire.h>
 #include <hardware/clocks.h>
 #include <hardware/gpio.h>
+#include <hardware/pio.h>
+#include <hardware/pio_instructions.h>
 #include <hardware/pwm.h>
 #include <stdlib.h>
 
@@ -13,6 +15,9 @@ namespace {
 constexpr uint8_t PIN_SENSOR_SDA = 16;
 constexpr uint8_t PIN_SENSOR_SCL = 17;
 constexpr uint8_t PIN_SPEAKER = 5;
+constexpr uint8_t PIN_LED_RED = 7;
+constexpr uint8_t PIN_LED_GREEN = 8;
+constexpr uint8_t PIN_LED_BLUE = 9;
 constexpr uint8_t PIN_NODE_RESET = 18;
 constexpr uint8_t PIN_EVENT = 19;
 constexpr uint32_t SENSOR_BUS_FREQUENCY_HZ = 10000;
@@ -102,6 +107,25 @@ uint8_t activeSoundLength = 0U;
 uint8_t activeSoundStep = 0U;
 uint32_t soundStepStartedMs = 0U;
 
+enum class ControllerLedState : uint8_t {
+  BOOT,
+  INTERNAL_FAULT,
+  BUS_FAULT,
+  AP_FAULT,
+  SETUP_WARNING,
+  START_BLOCKED,
+  GAME_BEAM_BROKEN,
+  HEALTHY,
+};
+
+PIO controllerLedPio = pio1;
+uint controllerLedSm = 0U;
+bool controllerLedInitialized = false;
+ControllerLedState controllerLedState = ControllerLedState::BOOT;
+bool controllerInternalFault = false;
+bool apHealthMonitoring = false;
+bool apWebHealthy = true;
+
 enum class IdentityReadResult : uint8_t {
   OK,
   ADDRESS_NACK,
@@ -114,6 +138,8 @@ enum class IdentityReadResult : uint8_t {
 
 IdentityReadResult lastReadResult = IdentityReadResult::WRITE_ERROR;
 uint8_t lastWireWriteResult = 0U;
+
+bool cachedLasersClear(void);
 
 const char *readResultName(IdentityReadResult result) {
   switch (result) {
@@ -216,6 +242,147 @@ void updateSound(void) {
     return;
   }
   beginSoundStep();
+}
+
+uint32_t ledPattern(uint8_t onColor, uint8_t onCount,
+                    uint8_t offColor, uint8_t offCount) {
+  return (uint32_t)(onColor & 0x07U) |
+         ((uint32_t)onCount << 3U) |
+         ((uint32_t)(offColor & 0x07U) << 11U) |
+         ((uint32_t)offCount << 14U);
+}
+
+uint32_t amberPattern(uint16_t onMs, uint16_t offMs) {
+  const uint16_t onCount = onMs == 0U ? 0U : (uint16_t)(onMs - 1U);
+  const uint16_t offCount = offMs == 0U ? 0U : (uint16_t)(offMs - 1U);
+  return (uint32_t)onCount | ((uint32_t)offCount << 16U);
+}
+
+uint32_t controllerLedPattern(ControllerLedState state) {
+  constexpr uint8_t RED = 0x01U;
+  constexpr uint8_t AMBER = 0x03U;
+  constexpr uint8_t BLUE = 0x04U;
+  constexpr uint8_t MAGENTA = 0x05U;
+  constexpr uint8_t WHITE = 0x07U;
+  switch (state) {
+    case ControllerLedState::BOOT:
+      return ledPattern(BLUE, 14U, 0U, 14U);
+    case ControllerLedState::INTERNAL_FAULT:
+      return ledPattern(RED, 6U, 0U, 6U);
+    case ControllerLedState::BUS_FAULT:
+      return ledPattern(RED, 30U, 0U, 30U);
+    case ControllerLedState::AP_FAULT:
+      return ledPattern(MAGENTA, 14U, 0U, 14U);
+    case ControllerLedState::SETUP_WARNING:
+      return ledPattern(WHITE, 5U, AMBER, 55U);
+    case ControllerLedState::START_BLOCKED:
+      return amberPattern(500U, 500U);
+    case ControllerLedState::GAME_BEAM_BROKEN:
+      return amberPattern(60000U, 0U);
+    case ControllerLedState::HEALTHY:
+      return ledPattern(BLUE, 5U, 0U, 55U);
+  }
+  return 0U;
+}
+
+void initializeControllerLed(void) {
+  static uint16_t instructions[32];
+  instructions[0] = pio_encode_pull(false, true);
+  instructions[1] = pio_encode_mov(pio_isr, pio_osr);
+  instructions[2] = pio_encode_mov(pio_osr, pio_isr);
+  instructions[3] = pio_encode_out(pio_pins, 3U);
+  instructions[4] = pio_encode_out(pio_x, 8U);
+  instructions[5] = pio_encode_set(pio_y, 15U);
+  instructions[6] = pio_encode_nop() | pio_encode_delay(31U);
+  instructions[7] = pio_encode_jmp_y_dec(6U);
+  instructions[8] = pio_encode_jmp_x_dec(5U);
+  instructions[9] = pio_encode_mov(pio_osr, pio_isr);
+  instructions[10] = pio_encode_out(pio_null, 11U);
+  instructions[11] = pio_encode_out(pio_pins, 3U);
+  instructions[12] = pio_encode_out(pio_x, 8U);
+  instructions[13] = pio_encode_set(pio_y, 15U);
+  instructions[14] = pio_encode_nop() | pio_encode_delay(31U);
+  instructions[15] = pio_encode_jmp_y_dec(14U);
+  instructions[16] = pio_encode_jmp_x_dec(13U);
+  instructions[17] = pio_encode_jmp(2U);
+  instructions[18] = pio_encode_pull(false, true);
+  instructions[19] = pio_encode_mov(pio_isr, pio_osr);
+  instructions[20] = pio_encode_mov(pio_osr, pio_isr);
+  instructions[21] = pio_encode_out(pio_x, 16U);
+  instructions[22] = pio_encode_set(pio_pins, 0x03U) |
+                     pio_encode_delay(7U);
+  instructions[23] = pio_encode_set(pio_pins, 0x01U) |
+                     pio_encode_delay(23U);
+  instructions[24] = pio_encode_jmp_x_dec(22U);
+  instructions[25] = pio_encode_mov(pio_osr, pio_isr);
+  instructions[26] = pio_encode_out(pio_null, 16U);
+  instructions[27] = pio_encode_out(pio_x, 16U);
+  instructions[28] = pio_encode_set(pio_pins, 0U);
+  instructions[29] = pio_encode_nop() | pio_encode_delay(31U);
+  instructions[30] = pio_encode_jmp_x_dec(29U);
+  instructions[31] = pio_encode_jmp(20U);
+  const pio_program program = {
+      .instructions = instructions,
+      .length = 32U,
+      .origin = 0,
+      .pio_version = 0U,
+  };
+
+  controllerLedSm = pio_claim_unused_sm(controllerLedPio, true);
+  pio_add_program_at_offset(controllerLedPio, &program, 0U);
+  pio_sm_config config = pio_get_default_sm_config();
+  sm_config_set_out_pins(&config, PIN_LED_RED, 3U);
+  sm_config_set_set_pins(&config, PIN_LED_RED, 3U);
+  sm_config_set_out_shift(&config, true, false, 32U);
+  sm_config_set_clkdiv(&config,
+      (float)clock_get_hz(clk_sys) / 33000.0F);
+  pio_gpio_init(controllerLedPio, PIN_LED_RED);
+  pio_gpio_init(controllerLedPio, PIN_LED_GREEN);
+  pio_gpio_init(controllerLedPio, PIN_LED_BLUE);
+  pio_sm_set_consecutive_pindirs(controllerLedPio, controllerLedSm,
+                                 PIN_LED_RED, 3U, true);
+  pio_sm_init(controllerLedPio, controllerLedSm, 0U, &config);
+  pio_sm_put_blocking(controllerLedPio, controllerLedSm,
+                      controllerLedPattern(ControllerLedState::BOOT));
+  pio_sm_set_enabled(controllerLedPio, controllerLedSm, true);
+  controllerLedInitialized = true;
+}
+
+void setControllerLed(ControllerLedState state) {
+  if (!controllerLedInitialized || state == controllerLedState) {
+    return;
+  }
+  controllerLedState = state;
+  pio_sm_set_enabled(controllerLedPio, controllerLedSm, false);
+  pio_sm_clear_fifos(controllerLedPio, controllerLedSm);
+  pio_sm_restart(controllerLedPio, controllerLedSm);
+  const bool amberPatternRequired =
+      state == ControllerLedState::START_BLOCKED ||
+      state == ControllerLedState::GAME_BEAM_BROKEN;
+  pio_sm_exec(controllerLedPio, controllerLedSm,
+              pio_encode_jmp(amberPatternRequired ? 18U : 0U));
+  pio_sm_put_blocking(controllerLedPio, controllerLedSm,
+                      controllerLedPattern(state));
+  pio_sm_set_enabled(controllerLedPio, controllerLedSm, true);
+}
+
+void updateControllerLed(void) {
+  ControllerLedState state = ControllerLedState::HEALTHY;
+  if (controllerInternalFault) {
+    state = ControllerLedState::INTERNAL_FAULT;
+  } else if (game.state == LP_GAME_FAULT) {
+    state = ControllerLedState::BUS_FAULT;
+  } else if (apHealthMonitoring && !apWebHealthy) {
+    state = ControllerLedState::AP_FAULT;
+  } else if (game.state == LP_GAME_SETUP) {
+    state = ControllerLedState::SETUP_WARNING;
+  } else if (game.state == LP_GAME_WAIT_START &&
+             !startAcceptanceEnabled) {
+    state = ControllerLedState::START_BLOCKED;
+  } else if (game.state != LP_GAME_SETUP && !cachedLasersClear()) {
+    state = ControllerLedState::GAME_BEAM_BROKEN;
+  }
+  setControllerLed(state);
 }
 
 void printIdentity(const lp_identity_register_t &identity);
@@ -1919,6 +2086,7 @@ void handleSerialInput(void) {
 }  // namespace
 
 void setup() {
+  initializeControllerLed();
   pinMode(PIN_SPEAKER, OUTPUT);
   digitalWrite(PIN_SPEAKER, LOW);
   pinMode(PIN_NODE_RESET, INPUT);
@@ -1933,6 +2101,8 @@ void setup() {
   }
 
   if (!Wire.setSDA(PIN_SENSOR_SDA) || !Wire.setSCL(PIN_SENSOR_SCL)) {
+    controllerInternalFault = true;
+    updateControllerLed();
     Serial.println("ERROR: GPIO 16/17 cannot be assigned to I2C0");
     return;
   }
@@ -1950,6 +2120,7 @@ void setup() {
     (void)validateInventory();
     pollInventory();
   }
+  updateControllerLed();
   printHelp();
 }
 
@@ -1970,4 +2141,5 @@ void loop() {
     pollInventory();
   }
   updateStartReadiness();
+  updateControllerLed();
 }

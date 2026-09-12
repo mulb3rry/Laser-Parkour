@@ -580,16 +580,30 @@ conditions override lower-priority indications.
 | 1 | Internal, storage, or unrecoverable controller fault | Fast red blink |
 | 2 | Required node missing, sensor-bus fault, or invalid node configuration | Slow red blink |
 | 3 | Wi-Fi access point failed or stopped unexpectedly | Magenta blink |
-| 4 | Setup incomplete or one or more beams currently broken | Amber with blue heartbeat |
-| 5 | System healthy and ready for operation | Blue heartbeat |
+| 4 | Controller is in setup mode | Yellow with blue heartbeat |
+| 5 | Start blocked or three-second clear interval active | Flashing amber |
+| 6 | Laser currently broken in game mode | Steady amber |
+| 7 | System healthy and ready for operation | Blue heartbeat |
+
+Amber uses full red and approximately 25% green, while setup yellow uses full
+red and green. The initial hardware-timed patterns are approximately 4 Hz for fast red, 1 Hz
+for slow red, and 2 Hz for magenta. The blue heartbeat is approximately 100 ms
+on per second. In the yellow setup indication, red and green remain on while
+that blue pulse is added. During boot, blue blinks at approximately 2 Hz. A dedicated
+RP2040 PIO state machine generates every periodic pattern without GPIO or timer
+interrupts.
 
 During boot and AP startup, the LED blinks blue. Once the access point is
 active, has a valid IP address, and the HTTP server is ready to accept requests,
-a brief blue heartbeat is shown. The heartbeat is also visible over the amber
-setup/readiness warning. When no warning is active, the LED remains off between
+a brief blue heartbeat is shown. The heartbeat is also visible over the yellow
+setup indication. When no warning is active, the LED remains off between
 blue heartbeat pulses. These indications remain the same throughout all game
 states. Loss of the AP or web server removes the heartbeat and activates the
 higher-priority AP-fault indication.
+
+Until the AP and HTTP server are implemented in Phase 4, their health input is
+not armed and therefore cannot produce a false magenta fault. The input becomes
+mandatory once those services are started.
 
 The LED controller receives controller health, storage health, bus/node health,
 AP/web health, and setup readiness as separate inputs and selects the
