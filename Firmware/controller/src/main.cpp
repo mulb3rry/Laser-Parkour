@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "laser_game_engine.h"
+#include "laser_controller_config.h"
 #include "laser_protocol.h"
 #include "laser_result_store.h"
 #include "laser_top_storage.h"
@@ -96,8 +97,12 @@ SensorConfigValues lastSensorConfig{240U, 16U, 30U, 500U};
 bool pendingSensorConfig = false;
 char sensorConfigInput[48]{};
 uint8_t sensorConfigInputLength = 0U;
+bool pendingPenalty = false;
+char penaltyInput[11]{};
+uint8_t penaltyInputLength = 0U;
 lp_game_engine_t game{};
 lp_result_store_t resultStore{};
+lp_controller_config_t controllerConfig{};
 bool resultFilesystemReady = false;
 bool pendingTopResultsClear = false;
 bool pendingPlayerName = false;
@@ -767,6 +772,73 @@ void printGameResult(const lp_game_result_t &result) {
 }
 
 constexpr const char *TOP_RESULTS_PATH = "/top10.dat";
+constexpr const char *CONTROLLER_CONFIG_PATH = "/controller.dat";
+
+bool saveControllerConfiguration(void) {
+  if (!resultFilesystemReady) {
+    return false;
+  }
+  uint8_t encoded[LP_CONTROLLER_CONFIG_ENCODED_SIZE];
+  if (!lp_controller_config_encode(&controllerConfig, encoded,
+                                   sizeof(encoded))) {
+    return false;
+  }
+  File file = LittleFS.open(CONTROLLER_CONFIG_PATH, "w");
+  if (!file) {
+    return false;
+  }
+  const size_t written = file.write(encoded, sizeof(encoded));
+  file.flush();
+  file.close();
+  if (written != sizeof(encoded)) {
+    return false;
+  }
+  File verification = LittleFS.open(CONTROLLER_CONFIG_PATH, "r");
+  if (!verification || verification.size() != sizeof(encoded)) {
+    verification.close();
+    return false;
+  }
+  uint8_t readback[LP_CONTROLLER_CONFIG_ENCODED_SIZE];
+  const size_t read = verification.read(readback, sizeof(readback));
+  verification.close();
+  lp_controller_config_t verified{};
+  return read == sizeof(readback) &&
+         memcmp(encoded, readback, sizeof(encoded)) == 0 &&
+         lp_controller_config_decode(&verified, readback, sizeof(readback));
+}
+
+void loadControllerConfiguration(void) {
+  lp_controller_config_defaults(&controllerConfig);
+  if (!resultFilesystemReady) {
+    return;
+  }
+  if (!LittleFS.exists(CONTROLLER_CONFIG_PATH)) {
+    if (saveControllerConfiguration()) {
+      Serial.println("Created controller configuration with factory defaults");
+    } else {
+      controllerInternalFault = true;
+      Serial.println("CONTROLLER STORAGE ERROR: defaults were not saved");
+    }
+    return;
+  }
+  File file = LittleFS.open(CONTROLLER_CONFIG_PATH, "r");
+  uint8_t encoded[LP_CONTROLLER_CONFIG_ENCODED_SIZE];
+  if (!file || file.size() != sizeof(encoded)) {
+    file.close();
+    Serial.println("CONTROLLER STORAGE WARNING: invalid file; using factory defaults");
+    return;
+  }
+  const size_t read = file.read(encoded, sizeof(encoded));
+  file.close();
+  if (read != sizeof(encoded) ||
+      !lp_controller_config_decode(&controllerConfig, encoded,
+                                   sizeof(encoded))) {
+    lp_controller_config_defaults(&controllerConfig);
+    Serial.println("CONTROLLER STORAGE WARNING: CRC or format invalid; using factory defaults");
+    return;
+  }
+  Serial.println("Loaded controller configuration from flash");
+}
 
 bool saveTopResults(void) {
   if (!resultFilesystemReady) {
@@ -1971,6 +2043,63 @@ bool consumeSensorConfig(char value) {
   return true;
 }
 
+void beginPenaltyEntry(void) {
+  pendingPenalty = true;
+  penaltyInputLength = 0U;
+  Serial.print("Enter penalty in milliseconds, or press Return to show current (");
+  Serial.print(controllerConfig.penalty_ms);
+  Serial.println(" ms):");
+}
+
+bool consumePenaltyEntry(char value) {
+  if (!pendingPenalty) {
+    return false;
+  }
+  if (value == '\r' || value == '\n') {
+    pendingPenalty = false;
+    if (penaltyInputLength == 0U) {
+      Serial.print("Current interruption penalty: ");
+      Serial.print(controllerConfig.penalty_ms);
+      Serial.println(" ms");
+      return true;
+    }
+    penaltyInput[penaltyInputLength] = '\0';
+    char *end = nullptr;
+    const unsigned long parsed = strtoul(penaltyInput, &end, 10);
+    if (end == penaltyInput || *end != '\0' || parsed > 3600000UL) {
+      Serial.println("Penalty rejected: expected 0-3600000 milliseconds");
+      return true;
+    }
+    const uint32_t previous = controllerConfig.penalty_ms;
+    controllerConfig.penalty_ms = static_cast<uint32_t>(parsed);
+    if (!saveControllerConfiguration()) {
+      controllerConfig.penalty_ms = previous;
+      controllerInternalFault = true;
+      updateControllerLed();
+      Serial.println("CONTROLLER STORAGE ERROR: penalty was not changed");
+      return true;
+    }
+    game.settings.penalty_ms = controllerConfig.penalty_ms;
+    Serial.print("Interruption penalty saved: ");
+    Serial.print(controllerConfig.penalty_ms);
+    Serial.println(" ms");
+    return true;
+  }
+  if ((value == '\b' || value == 0x7F) && penaltyInputLength != 0U) {
+    --penaltyInputLength;
+    return true;
+  }
+  if (value < '0' || value > '9' ||
+      penaltyInputLength >= sizeof(penaltyInput) - 1U) {
+    pendingPenalty = false;
+    penaltyInputLength = 0U;
+    Serial.println("Penalty entry cancelled: expected decimal milliseconds");
+    return true;
+  }
+  penaltyInput[penaltyInputLength++] = value;
+  return true;
+}
+
 int8_t hexNibble(char value) {
   if (value >= '0' && value <= '9') {
     return static_cast<int8_t>(value - '0');
@@ -2094,6 +2223,8 @@ void printHelp(void) {
   Serial.println("  t       print game state and live score");
   Serial.println("  o       print the top ten scores");
   Serial.println("  q       clear the top ten after confirmation (SETUP)");
+  Serial.println("  yMS     set interruption penalty in milliseconds (SETUP)");
+  Serial.println("  y<Enter> print the current interruption penalty (SETUP)");
   Serial.println("  m       print the ten most recent attempts");
   Serial.println("  b       abort player preparation or the active run");
   Serial.println("  u       return the complete system to SETUP");
@@ -2134,6 +2265,8 @@ bool isSetupOnlyCommand(char command) {
     case 'F':
     case 'q':
     case 'Q':
+    case 'y':
+    case 'Y':
       return true;
     default:
       return false;
@@ -2160,6 +2293,9 @@ void handleSerialInput(void) {
       } else {
         Serial.println("Top-10 clear cancelled");
       }
+      continue;
+    }
+    if (consumePenaltyEntry(command)) {
       continue;
     }
     if (isSetupOnlyCommand(command) && game.state != LP_GAME_SETUP) {
@@ -2198,6 +2334,9 @@ void handleSerialInput(void) {
     } else if (command == 'q' || command == 'Q') {
       Serial.println();
       requestTopResultsClear();
+    } else if (command == 'y' || command == 'Y') {
+      Serial.println();
+      beginPenaltyEntry();
     } else if (command == 'm' || command == 'M') {
       Serial.println();
       printRecentResults();
@@ -2277,13 +2416,14 @@ void setup() {
 
   Wire.begin();
   Wire.setClock(SENSOR_BUS_FREQUENCY_HZ);
-  const lp_game_settings_t gameSettings = {
-      .penalty_ms = 5000U,
-      .maximum_run_ms = 10U * 60U * 1000U,
-  };
-  lp_game_init(&game, gameSettings);
   lp_result_store_init(&resultStore);
   initializeResultStorage();
+  loadControllerConfiguration();
+  const lp_game_settings_t gameSettings = {
+      .penalty_ms = controllerConfig.penalty_ms,
+      .maximum_run_ms = controllerConfig.maximum_run_ms,
+  };
+  lp_game_init(&game, gameSettings);
   (void)monotonicMicros();
   if (discoverNode()) {
     printInventory();

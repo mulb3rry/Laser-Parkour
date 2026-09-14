@@ -419,9 +419,12 @@ The controller persists:
 
 - penalty and game settings;
 - Wi-Fi SSID, password, and country configuration;
-- expected node addresses and roles;
-- per-node laser configuration;
 - top-ten scores.
+
+Node addresses, roles, and sensor settings are deliberately not copied into
+controller storage. Each commissioned ATtiny retains those values in its own
+EEPROM, and the controller discovers and validates the nodes connected for the
+current parcours at setup time.
 
 Both result collections have a fixed capacity of ten entries, but only the
 top-ten successful scores are persisted. The ten most recent completed or
@@ -441,13 +444,20 @@ In `SETUP`, the command `q` asks for confirmation before clearing the Top 10
 from RAM and flash. Entering `y` confirms; Return, `n`, or any other response
 cancels. The recent-attempt list is not cleared.
 
-The initial implementation deliberately uses one storage file instead of two
-recoverable slots. A power loss or manual reset during its short write may
-invalidate and lose the complete Top 10; an invalid length, format version, or
-CRC is detected at startup and produces an empty list plus a serial warning.
-This accepted limitation keeps the implementation small. Player names must be
-stored and rendered as UTF-8, validated for length, and escaped before
-insertion into HTML.
+The Setup-only command `yMS` changes the interruption penalty in milliseconds,
+persists it in `/controller.dat`, and applies it to subsequent runs. For
+example, `y2500` selects a 2.5-second penalty. Entering `y` followed by Return
+prints the current value without changing it. The accepted range is 0 to
+3,600,000 ms.
+
+The initial implementation uses `/top10.dat` for the scoreboard and
+`/controller.dat` for penalty, maximum run time, and Wi-Fi configuration. Each
+is a versioned, CRC-protected single file rather than two recoverable slots. A
+power loss or manual reset during its short write may invalidate and lose that
+record; an invalid length, format version, or CRC selects safe defaults and
+produces a serial warning. This accepted limitation keeps the implementation
+small. Player names must be stored and rendered as UTF-8, validated for length,
+and escaped before insertion into HTML.
 
 Nodes persist only address, role, sensor configuration, configuration version,
 and checksum. They do not persist game state or interruption history.
@@ -829,13 +839,16 @@ deterministic scores and correct behavior for invalid and fault events.
 
 ### 3. Persistence
 
-- Implement versioned, atomic controller storage and migration/default handling.
-- Store settings, node inventory/configuration, recent attempts, and top scores.
-- Test interrupted writes, corrupted records, and both result-list capacity
-  limits.
+- Implement versioned, CRC-protected single-file controller storage and safe
+  default handling.
+- Store game and Wi-Fi settings and top scores. Node configuration remains only
+  in each node's EEPROM, and recent attempts remain only in controller RAM.
+- Test corrupted records and both result-list capacity limits. Interrupted
+  writes may lose the affected record because dual-slot recovery is explicitly
+  outside the initial scope.
 
-**Exit criterion:** completed data survives reboot and simulated incomplete or
-corrupt writes recover without preventing setup.
+**Exit criterion:** controller settings and top scores survive reboot; missing
+or corrupt records fall back safely without preventing setup.
 
 ### 4. Web Interface
 
