@@ -9,6 +9,7 @@
 
 #include "laser_game_engine.h"
 #include "laser_protocol.h"
+#include "laser_result_store.h"
 
 namespace {
 
@@ -93,6 +94,7 @@ bool pendingSensorConfig = false;
 char sensorConfigInput[48]{};
 uint8_t sensorConfigInputLength = 0U;
 lp_game_engine_t game{};
+lp_result_store_t resultStore{};
 bool pendingPlayerName = false;
 char playerInput[LP_GAME_PLAYER_NAME_BYTES + 1U]{};
 uint8_t playerInputLength = 0U;
@@ -759,6 +761,43 @@ void printGameResult(const lp_game_result_t &result) {
   Serial.println(" ms");
 }
 
+void recordAndPrintGameResult(void) {
+  if (!lp_result_store_record(&resultStore, &game.last_result)) {
+    Serial.println("RESULT STORE ERROR: result was not recorded");
+  }
+  printGameResult(game.last_result);
+}
+
+void printStoredResults(const char *title, const lp_stored_result_t *entries,
+                        uint8_t count) {
+  Serial.print(title);
+  Serial.print(": ");
+  Serial.print(count);
+  Serial.println(" result(s)");
+  if (count == 0U) {
+    Serial.println("  - empty -");
+    return;
+  }
+  for (uint8_t index = 0U; index < count; ++index) {
+    Serial.print("  ");
+    Serial.print(index + 1U);
+    Serial.print(". #");
+    Serial.print(static_cast<unsigned long long>(
+        entries[index].completion_sequence));
+    Serial.print(' ');
+    printGameResult(entries[index].result);
+  }
+}
+
+void printRecentResults(void) {
+  printStoredResults("Recent attempts", resultStore.recent,
+                     resultStore.recent_count);
+}
+
+void printTopResults(void) {
+  printStoredResults("Top scores", resultStore.top, resultStore.top_count);
+}
+
 void printGameStatus(void) {
   Serial.print("Game state: ");
   Serial.println(lp_game_state_name(game.state));
@@ -989,7 +1028,7 @@ void armPlayer(const char *player) {
 }
 
 void finishAndAdvance(void) {
-  printGameResult(game.last_result);
+  recordAndPrintGameResult();
   startAcceptanceEnabled = false;
   startClearTimerActive = false;
   (void)setButtonLedGuidance(LP_BUTTON_LED_STANDBY,
@@ -1061,7 +1100,7 @@ void reportGameFault(const char *reason) {
                              LP_BUTTON_LED_STANDBY);
   playSound(SOUND_FAULT);
   if (attemptActive) {
-    printGameResult(game.last_result);
+    recordAndPrintGameResult();
   }
 }
 
@@ -1079,7 +1118,7 @@ void abortGame(void) {
 void returnGameToSetup(void) {
   if (game.state == LP_GAME_WAIT_START || game.state == LP_GAME_WAIT_FINISH) {
     if (lp_game_abort(&game, monotonicMicros()) == LP_GAME_OK) {
-      printGameResult(game.last_result);
+      recordAndPrintGameResult();
     }
   }
   (void)setAllNodeModes(LP_MODE_SETUP);
@@ -1948,6 +1987,8 @@ void printHelp(void) {
   Serial.println("  w       validate the bus and enter game mode");
   Serial.println("  jNAME   submit the player name when requested");
   Serial.println("  t       print game state and live score");
+  Serial.println("  o       print the top ten scores");
+  Serial.println("  m       print the ten most recent attempts");
   Serial.println("  b       abort player preparation or the active run");
   Serial.println("  u       return the complete system to SETUP");
   Serial.println("  iXX     stage a laser at address 0xXX (SETUP)");
@@ -2033,6 +2074,12 @@ void handleSerialInput(void) {
     } else if (command == 't' || command == 'T') {
       Serial.println();
       printGameStatus();
+    } else if (command == 'o' || command == 'O') {
+      Serial.println();
+      printTopResults();
+    } else if (command == 'm' || command == 'M') {
+      Serial.println();
+      printRecentResults();
     } else if (command == 'b' || command == 'B') {
       Serial.println();
       abortGame();
@@ -2114,6 +2161,7 @@ void setup() {
       .maximum_run_ms = 10U * 60U * 1000U,
   };
   lp_game_init(&game, gameSettings);
+  lp_result_store_init(&resultStore);
   (void)monotonicMicros();
   if (discoverNode()) {
     printInventory();

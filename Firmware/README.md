@@ -430,6 +430,11 @@ interruption count, penalty used, score time, result status, and client-derived
 completion timestamp. A persistent completion sequence number is used for
 tie-breaking; client-provided timestamps are never trusted for ordering.
 
+The first Phase 3 slice maintains both collections in RAM. The serial command
+`m` prints the ten most recent attempts newest-first, including aborted
+attempts. The command `o` prints the top ten successful scores. These lists are
+cleared by a controller restart until the persistent-storage slice is added.
+
 Writes must be versioned and recoverable after a partial flash write, using two
 slots, a journal, or another atomic commit strategy. Flash writes should be
 batched to avoid unnecessary wear. Player names must be stored and rendered as
