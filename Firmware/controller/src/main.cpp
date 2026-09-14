@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <LittleFS.h>
 #include <Wire.h>
 #include <hardware/clocks.h>
 #include <hardware/gpio.h>
@@ -6,10 +7,12 @@
 #include <hardware/pio_instructions.h>
 #include <hardware/pwm.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "laser_game_engine.h"
 #include "laser_protocol.h"
 #include "laser_result_store.h"
+#include "laser_top_storage.h"
 
 namespace {
 
@@ -95,6 +98,8 @@ char sensorConfigInput[48]{};
 uint8_t sensorConfigInputLength = 0U;
 lp_game_engine_t game{};
 lp_result_store_t resultStore{};
+bool resultFilesystemReady = false;
+bool pendingTopResultsClear = false;
 bool pendingPlayerName = false;
 char playerInput[LP_GAME_PLAYER_NAME_BYTES + 1U]{};
 uint8_t playerInputLength = 0U;
@@ -761,9 +766,87 @@ void printGameResult(const lp_game_result_t &result) {
   Serial.println(" ms");
 }
 
+constexpr const char *TOP_RESULTS_PATH = "/top10.dat";
+
+bool saveTopResults(void) {
+  if (!resultFilesystemReady) {
+    return false;
+  }
+  uint8_t encoded[LP_TOP_STORAGE_ENCODED_SIZE];
+  if (!lp_top_storage_encode(&resultStore, encoded, sizeof(encoded))) {
+    return false;
+  }
+  File file = LittleFS.open(TOP_RESULTS_PATH, "w");
+  if (!file) {
+    return false;
+  }
+  const size_t written = file.write(encoded, sizeof(encoded));
+  file.flush();
+  file.close();
+  if (written != sizeof(encoded)) {
+    return false;
+  }
+
+  File verification = LittleFS.open(TOP_RESULTS_PATH, "r");
+  if (!verification || verification.size() != sizeof(encoded)) {
+    verification.close();
+    return false;
+  }
+  uint8_t readback[LP_TOP_STORAGE_ENCODED_SIZE];
+  const size_t read = verification.read(readback, sizeof(readback));
+  verification.close();
+  lp_result_store_t verified{};
+  return read == sizeof(readback) &&
+         memcmp(encoded, readback, sizeof(encoded)) == 0 &&
+         lp_top_storage_decode(&verified, readback, sizeof(readback));
+}
+
+void initializeResultStorage(void) {
+  // Arduino-Pico formats an unused filesystem region on its first mount.
+  resultFilesystemReady = LittleFS.begin();
+  if (!resultFilesystemReady) {
+    controllerInternalFault = true;
+    Serial.println("TOP-10 STORAGE ERROR: LittleFS could not be mounted");
+    return;
+  }
+  if (!LittleFS.exists(TOP_RESULTS_PATH)) {
+    Serial.println("Top-10 storage is empty");
+    return;
+  }
+  File file = LittleFS.open(TOP_RESULTS_PATH, "r");
+  if (!file || file.size() != LP_TOP_STORAGE_ENCODED_SIZE) {
+    file.close();
+    Serial.println("TOP-10 STORAGE WARNING: invalid file; using an empty list");
+    return;
+  }
+  uint8_t encoded[LP_TOP_STORAGE_ENCODED_SIZE];
+  const size_t read = file.read(encoded, sizeof(encoded));
+  file.close();
+  if (read != sizeof(encoded) ||
+      !lp_top_storage_decode(&resultStore, encoded, sizeof(encoded))) {
+    lp_result_store_init(&resultStore);
+    Serial.println("TOP-10 STORAGE WARNING: CRC or format invalid; using an empty list");
+    return;
+  }
+  Serial.print("Loaded ");
+  Serial.print(resultStore.top_count);
+  Serial.println(" Top-10 result(s) from flash");
+}
+
 void recordAndPrintGameResult(void) {
+  const uint8_t previousTopCount = resultStore.top_count;
+  lp_stored_result_t previousTop[LP_RESULT_STORE_CAPACITY];
+  memcpy(previousTop, resultStore.top, sizeof(previousTop));
   if (!lp_result_store_record(&resultStore, &game.last_result)) {
     Serial.println("RESULT STORE ERROR: result was not recorded");
+  }
+  const bool topChanged = previousTopCount != resultStore.top_count ||
+                          memcmp(previousTop, resultStore.top,
+                                 sizeof(previousTop)) != 0;
+  if (topChanged && !saveTopResults()) {
+    controllerInternalFault = true;
+    updateControllerLed();
+    Serial.println("TOP-10 STORAGE ERROR: updated list was not saved");
   }
   printGameResult(game.last_result);
 }
@@ -796,6 +879,28 @@ void printRecentResults(void) {
 
 void printTopResults(void) {
   printStoredResults("Top scores", resultStore.top, resultStore.top_count);
+}
+
+void requestTopResultsClear(void) {
+  pendingTopResultsClear = true;
+  Serial.println("Do you really want to clear the complete Top 10? (y/N)");
+}
+
+void clearTopResults(void) {
+  if (!resultFilesystemReady) {
+    Serial.println("TOP-10 STORAGE ERROR: LittleFS is unavailable; list not cleared");
+    return;
+  }
+  if (LittleFS.exists(TOP_RESULTS_PATH) &&
+      !LittleFS.remove(TOP_RESULTS_PATH)) {
+    controllerInternalFault = true;
+    updateControllerLed();
+    Serial.println("TOP-10 STORAGE ERROR: file could not be removed; list not cleared");
+    return;
+  }
+  memset(resultStore.top, 0, sizeof(resultStore.top));
+  resultStore.top_count = 0U;
+  Serial.println("Top 10 cleared; recent attempts were retained");
 }
 
 void printGameStatus(void) {
@@ -1988,6 +2093,7 @@ void printHelp(void) {
   Serial.println("  jNAME   submit the player name when requested");
   Serial.println("  t       print game state and live score");
   Serial.println("  o       print the top ten scores");
+  Serial.println("  q       clear the top ten after confirmation (SETUP)");
   Serial.println("  m       print the ten most recent attempts");
   Serial.println("  b       abort player preparation or the active run");
   Serial.println("  u       return the complete system to SETUP");
@@ -2026,6 +2132,8 @@ bool isSetupOnlyCommand(char command) {
     case 'N':
     case 'f':
     case 'F':
+    case 'q':
+    case 'Q':
       return true;
     default:
       return false;
@@ -2042,6 +2150,16 @@ void handleSerialInput(void) {
       continue;
     }
     if (consumePendingAddress(command)) {
+      continue;
+    }
+    if (pendingTopResultsClear) {
+      pendingTopResultsClear = false;
+      Serial.println();
+      if (command == 'y' || command == 'Y') {
+        clearTopResults();
+      } else {
+        Serial.println("Top-10 clear cancelled");
+      }
       continue;
     }
     if (isSetupOnlyCommand(command) && game.state != LP_GAME_SETUP) {
@@ -2077,6 +2195,9 @@ void handleSerialInput(void) {
     } else if (command == 'o' || command == 'O') {
       Serial.println();
       printTopResults();
+    } else if (command == 'q' || command == 'Q') {
+      Serial.println();
+      requestTopResultsClear();
     } else if (command == 'm' || command == 'M') {
       Serial.println();
       printRecentResults();
@@ -2162,6 +2283,7 @@ void setup() {
   };
   lp_game_init(&game, gameSettings);
   lp_result_store_init(&resultStore);
+  initializeResultStorage();
   (void)monotonicMicros();
   if (discoverNode()) {
     printInventory();

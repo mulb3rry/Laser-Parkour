@@ -421,24 +421,33 @@ The controller persists:
 - Wi-Fi SSID, password, and country configuration;
 - expected node addresses and roles;
 - per-node laser configuration;
-- top-ten scores; and
-- the most recent completed/aborted attempts.
+- top-ten scores.
 
-Both result collections have a fixed capacity of ten entries. No additional
-history is retained. Each entry contains the player name, raw time,
-interruption count, penalty used, score time, result status, and client-derived
-completion timestamp. A persistent completion sequence number is used for
-tie-breaking; client-provided timestamps are never trusted for ordering.
+Both result collections have a fixed capacity of ten entries, but only the
+top-ten successful scores are persisted. The ten most recent completed or
+aborted attempts remain in RAM and are intentionally lost on a controller
+restart. No additional history is retained. Each entry contains the player
+name, raw time, interruption count, penalty used, score time, result status,
+and client-derived completion timestamp. A persistent completion sequence
+number is used for tie-breaking; client-provided timestamps are never trusted
+for ordering.
 
 The first Phase 3 slice maintains both collections in RAM. The serial command
 `m` prints the ten most recent attempts newest-first, including aborted
-attempts. The command `o` prints the top ten successful scores. These lists are
-cleared by a controller restart until the persistent-storage slice is added.
+attempts. The command `o` prints the top ten successful scores. The controller
+stores the Top 10 in one versioned, CRC-protected LittleFS file and loads it at
+startup. Flash is written only when a completed run changes the Top 10.
+In `SETUP`, the command `q` asks for confirmation before clearing the Top 10
+from RAM and flash. Entering `y` confirms; Return, `n`, or any other response
+cancels. The recent-attempt list is not cleared.
 
-Writes must be versioned and recoverable after a partial flash write, using two
-slots, a journal, or another atomic commit strategy. Flash writes should be
-batched to avoid unnecessary wear. Player names must be stored and rendered as
-UTF-8, validated for length, and escaped before insertion into HTML.
+The initial implementation deliberately uses one storage file instead of two
+recoverable slots. A power loss or manual reset during its short write may
+invalidate and lose the complete Top 10; an invalid length, format version, or
+CRC is detected at startup and produces an empty list plus a serial warning.
+This accepted limitation keeps the implementation small. Player names must be
+stored and rendered as UTF-8, validated for length, and escaped before
+insertion into HTML.
 
 Nodes persist only address, role, sensor configuration, configuration version,
 and checksum. They do not persist game state or interruption history.
