@@ -78,6 +78,7 @@ struct SensorConfigValues {
 NodeInventoryEntry inventory[LP_MAX_TOTAL_NODES];
 uint8_t inventoryCount = 0U;
 bool inventoryOverflow = false;
+bool i2cBusLocked = false;
 
 uint32_t successfulReads = 0;
 uint32_t failedReads = 0;
@@ -526,6 +527,7 @@ bool validateInventory(void) {
 
 bool readRegisterBlock(uint8_t registerAddress, uint8_t *bytes,
                        size_t expected) {
+  Wire.clearTimeoutFlag();
   Wire.beginTransmission(nodeAddress);
   Wire.write(registerAddress);
   // Use a STOP between pointer selection and reading while validating the
@@ -681,6 +683,7 @@ bool readStagedIdentity(lp_staged_identity_register_t &staged) {
 
 bool writeRegisterBlock(uint8_t registerAddress, const uint8_t *bytes,
                         size_t length) {
+  Wire.clearTimeoutFlag();
   Wire.beginTransmission(nodeAddress);
   Wire.write(registerAddress);
   Wire.write(bytes, length);
@@ -1025,6 +1028,8 @@ String webSystemJson(void) {
   output += controllerWebHealthy() ? F("true") : F("false");
   output += F(",\"internal_fault\":");
   output += controllerInternalFault ? F("true") : F("false");
+  output += F(",\"bus_locked\":");
+  output += i2cBusLocked ? F("true") : F("false");
   output += F(",\"bus_reads_ok\":"); output += successfulReads;
   output += F(",\"bus_reads_failed\":"); output += failedReads;
   output += F(",\"poll_cycles\":"); output += pollCycles;
@@ -1350,18 +1355,21 @@ bool allLaserCountersZero(void) {
 
 void enterGameReady(void) {
   lp_game_enter_setup(&game);
-  if (!discoverInventory() || !inventoryReadyForGame(false)) {
-    (void)lp_game_enter_game(&game, false);
+  // The current inventory is the operator's required-node snapshot. Never
+  // rebuild it implicitly here: an unavailable entry must block Game mode
+  // until it reconnects or the operator deliberately runs Rescan.
+  if (inventoryCount == 0U || !inventoryReadyForGame(false)) {
     playSound(SOUND_FAULT);
-    Serial.println("Game readiness failed; state is FAULT");
+    Serial.println("Game readiness failed; remaining in SETUP");
     return;
   }
   if (!setAllNodeModes(LP_MODE_GAME) ||
       !setButtonLedGuidance(LP_BUTTON_LED_STANDBY,
                             LP_BUTTON_LED_STANDBY)) {
-    (void)lp_game_enter_game(&game, false);
+    (void)setAllNodeModes(LP_MODE_SETUP);
+    lp_game_enter_setup(&game);
     playSound(SOUND_FAULT);
-    Serial.println("Game readiness failed while entering GAME mode");
+    Serial.println("Game readiness failed while changing node modes; remaining in SETUP");
     return;
   }
   (void)lp_game_enter_game(&game, true);
@@ -1927,6 +1935,8 @@ int webSetGameMode(String &response) {
 
 int webRescanNodes(String &response) {
   if (const int denied = webRequireSetup(response)) return denied;
+  Serial.println();
+  Serial.println("WEB: rebuilding node inventory");
   const bool found = discoverNode();
   if (found) {
     pollInventory();
@@ -1936,6 +1946,9 @@ int webRescanNodes(String &response) {
              F(",\"message\":\"") +
              (found ? "Node rescan complete" : "No valid nodes discovered") +
              F("\",\"count\":") + inventoryCount + '}';
+  Serial.print("WEB: inventory rebuild found ");
+  Serial.print(inventoryCount);
+  Serial.println(" node(s)");
   return found ? 200 : 409;
 }
 
@@ -2133,7 +2146,9 @@ uint16_t pollInventoryEntry(uint8_t index, bool dueToFu) {
   nodeAddress = entry.address;
 
   lp_fast_status_register_t status{};
-  if (!readWithRetries(status)) {
+  const bool statusValid = entry.available ? readWithRetries(status)
+                                           : readFastStatus(status);
+  if (!statusValid) {
     ++failedReads;
     if (entry.available) {
       Serial.print("Node 0x");
@@ -2245,13 +2260,52 @@ uint16_t pollInventoryEntry(uint8_t index, bool dueToFu) {
 
 void pollInventory(void) {
   const uint32_t startedUs = micros();
+  bool lockDetectedThisCycle = false;
   for (uint8_t index = 0U; index < inventoryCount; ++index) {
+    // Missing nodes are checked at 1 Hz with a single transaction. Retrying
+    // every missing address three times at 10 Hz can monopolize the main loop
+    // and prevent serial/HTTP recovery work.
+    if (!inventory[index].available && pollCycles % 10U != 0U) {
+      continue;
+    }
     const uint8_t role = inventory[index].identity.role;
     if (fuCorrelationPending &&
         (role == LP_ROLE_START || role == LP_ROLE_FINISH)) {
       continue;
     }
     (void)pollInventoryEntry(index, false);
+    const bool transactionTimedOut = Wire.getTimeoutFlag() ||
+                                     lastWireWriteResult == 5U;
+    const bool linesStuck = digitalRead(PIN_SENSOR_SDA) == LOW ||
+                            digitalRead(PIN_SENSOR_SCL) == LOW;
+    if (!inventory[index].available &&
+        (transactionTimedOut || linesStuck)) {
+      lockDetectedThisCycle = true;
+      if (!i2cBusLocked) {
+        Serial.print(linesStuck ? "I2C BUS LOCK detected"
+                                : "I2C timeout recovered");
+        Serial.print("; ending poll early (SDA=");
+        Serial.print(digitalRead(PIN_SENSOR_SDA));
+        Serial.print(", SCL=");
+        Serial.print(digitalRead(PIN_SENSOR_SCL));
+        Serial.println(")");
+      }
+      i2cBusLocked = true;
+      // A bus disturbance says nothing about the state of nodes that were not
+      // polled. Keep their last known availability. Marking all later entries
+      // unavailable makes status depend on address order and prevents those
+      // nodes from being reached while an earlier address remains absent.
+      if (linesStuck) {
+        reportGameFault("I2C bus locked");
+      }
+      break;
+    }
+  }
+  if (!lockDetectedThisCycle && i2cBusLocked &&
+      digitalRead(PIN_SENSOR_SDA) == HIGH &&
+      digitalRead(PIN_SENSOR_SCL) == HIGH) {
+    i2cBusLocked = false;
+    Serial.println("I2C bus recovered; normal inventory polling resumed");
   }
   lastPollDurationUs = micros() - startedUs;
   if (lastPollDurationUs > maximumPollDurationUs) {
@@ -2961,6 +3015,10 @@ void setup() {
 
   Wire.begin();
   Wire.setClock(SENSOR_BUS_FREQUENCY_HZ);
+  // A disconnected or partially powered node can hold SDA low. Limit each
+  // blocking transaction and let Arduino-Pico reset I2C0, pulse SCL, and send
+  // a STOP after a timeout.
+  Wire.setTimeout(25U, true);
   lp_result_store_init(&resultStore);
   initializeResultStorage();
   loadControllerConfiguration();
@@ -3033,8 +3091,10 @@ void loop() {
     finishAndAdvance();
   }
   if (millis() - lastPollMs >= POLL_INTERVAL_MS) {
-    lastPollMs = millis();
     pollInventory();
+    // Schedule from completion, not from the start. Otherwise a slow failed
+    // poll is already overdue and can starve serial and HTTP handling.
+    lastPollMs = millis();
   }
   refreshWebNodeDetailCache();
   updateStartReadiness();

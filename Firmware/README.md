@@ -918,6 +918,10 @@ the diagnostic dashboard remains available only at `/debug`.
   deliberate Setup/Game transitions, and a confirmed Top-10 reset. Returning
   to Setup may abort an active attempt, so loading the page itself never
   changes controller or node mode.
+- Entering Game validates the existing inventory without rebuilding it. Every
+  listed node must respond; a missing node keeps the controller in `SETUP`.
+  Only an explicit Rescan may remove disconnected nodes from the required
+  inventory before another Game-mode attempt.
 - Separate Game and Wi-Fi configuration sections save interruption penalty,
   maximum run time, SSID, and password to `/controller.dat`. The password has
   a show/hide control; changed Wi-Fi credentials apply after controller
@@ -933,7 +937,10 @@ the diagnostic dashboard remains available only at `/debug`.
   counters and active settings, and—on laser nodes—a Configure button. The
   common configuration section reports whether all discovered lasers use the
   same active values and warns if values differ or cannot be read. A confirmed
-  setup-only action resets the event counters of all discovered laser nodes.
+  setup-only action resets the event counters of all discovered laser nodes,
+  and Rebuild Inventory performs the same full discovery as serial command
+  `d`. The inventory summary reports totals by role, laser input state, and
+  availability above the detailed table.
 - Each discovered node has an Identify action. Node commissioning remains an
   intentionally CLI-only operation.
 - All values are validated by both browser controls and firmware. Mutating
@@ -995,6 +1002,14 @@ can reconnect, and factory recovery prevents permanent loss of access.
 
 #### 4.8 Robustness and final validation
 
+- I2C transactions use a 25 ms timeout with Arduino-Pico's controller reset and
+  nine-clock bus-clear recovery enabled. A stuck-low SDA/SCL condition ends the
+  current inventory cycle instead of retrying every node. An unavailable node
+  is subsequently probed once per second with one transaction. A timeout or
+  stuck-line observation never changes the availability of nodes not yet
+  polled; their last confirmed state is retained independently of address
+  order. Poll scheduling starts after completion so repeated failures cannot
+  starve serial and HTTP handling.
 - Test browser disconnect/reconnect, controller restart, bus faults during HTTP
   requests, multiple tabs, malformed and oversized input, and long-running SSE.
 - Exercise the maximum supported inventory while serving live updates and
