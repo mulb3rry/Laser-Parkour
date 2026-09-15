@@ -852,14 +852,143 @@ or corrupt records fall back safely without preventing setup.
 
 ### 4. Web Interface
 
-- Implement AP configuration, editable persisted credentials, HTTP API, SSE
-  state stream, setup view, and game view.
-- Implement browser time synchronization and unknown-time behavior.
-- Validate and escape all user input.
-- Test browser disconnect/reconnect during setup and during a run.
+Phase 4 is developed as vertical slices so networking can be tested without
+introducing the complete operator interface at once. Web functionality should
+be kept outside the already large controller `main.cpp`, using focused modules
+for controller storage, HTTP/API handling, and compiled-in web assets. HTML,
+CSS, and JavaScript are compiled into the firmware rather than uploaded as a
+LittleFS image, because uploading an image could erase persisted settings and
+scores.
 
-**Exit criterion:** one PC can configure the system and operate a full game,
-including queuing the next player, without serial access.
+#### 4.1 Production access point and HTTP foundation
+
+Implemented by `controller_web.cpp`: web assets are compiled into the firmware,
+the root page reports that the controller server is running, and
+`GET /api/health` returns JSON containing the health state and AP address.
+
+- Start the Pico W access point using the country, SSID, and password loaded
+  from `/controller.dat`.
+- Print the active SSID and IP address to serial and connect AP/HTTP health to
+  the RGB system-status priority logic.
+- Serve a minimal page and a `GET /api/health` endpoint without delaying bus
+  polling or game processing.
+
+**Exit criterion:** an operator PC connects and opens the health page while the
+normal node inventory remains stable at its required polling rate.
+
+#### 4.2 Read-only state API and initial interface
+
+Implemented endpoints are `/api/system`, `/api/game`, `/api/nodes`,
+`/api/nodes/XX`, `/api/results/recent`, `/api/results/top`, and `/api/settings`.
+The compiled-in responsive polling dashboard is available at `/debug`. The
+normal root redirects to `/setup`; `/game` remains a placeholder for its later
+implementation. HTTP handlers use only controller RAM. Node diagnostics are
+refreshed into a staggered cache,
+and browser requests never initiate I2C transactions.
+
+- Provide JSON representations of controller/game state, discovered inventory,
+  selected-node details, sensor values, live timing, recent attempts, Top 10,
+  and non-secret settings.
+- Add a responsive read-only page presenting the same operational information
+  currently available through serial diagnostics.
+- Encode JSON correctly and escape all browser-rendered values.
+
+**Exit criterion:** the browser displays the complete current setup and game
+state without requiring serial access.
+
+#### 4.3 Page structure and navigation
+
+- Keep the read-only polling and diagnostic presentation at `/debug`.
+- Use `/setup` as the normal root destination and reserve `/game` for active
+  game operation.
+- Do not display direct navigation links between Setup, Game, and Debug.
+  Explicit mode buttons perform the controller transition and use browser
+  history replacement when moving between `/setup` and `/game`, preventing the
+  Back button from restoring the previous mode page. `/debug` remains directly
+  accessible by entering its address.
+
+**Exit criterion:** `/` redirects to `/setup`, explicit buttons switch between
+Setup and Game without retaining the prior mode page in browser history, and
+the diagnostic dashboard remains available only at `/debug`.
+
+#### 4.4 Setup controls
+
+- The system section shows AP health, SSID, IP address, uptime, game state,
+  node count, controller health, and bus-read failures. It contains bus rescan,
+  deliberate Setup/Game transitions, and a confirmed Top-10 reset. Returning
+  to Setup may abort an active attempt, so loading the page itself never
+  changes controller or node mode.
+- Separate Game and Wi-Fi configuration sections save interruption penalty,
+  maximum run time, SSID, and password to `/controller.dat`. The password has
+  a show/hide control; changed Wi-Fi credentials apply after controller
+  restart.
+- A common sensor form applies threshold, hysteresis, stable time, and cooldown
+  to all discovered laser nodes. The browser saves one node per request and
+  reports progress, avoiding a long-running HTTP request while multiple nodes
+  write EEPROM. Polling pauses during configuration writes. The compact
+  inventory refreshes every two seconds; slower-changing system status is
+  refreshed every ten seconds. Each node line has separate type, input-state,
+  and availability columns, an Info button for versions, ADC readings,
+  counters and active settings, and—on laser nodes—a Configure button. The
+  common configuration section reports whether all discovered lasers use the
+  same active values and warns if values differ or cannot be read.
+- Each discovered node has an Identify action. Node commissioning remains an
+  intentionally CLI-only operation.
+- All values are validated by both browser controls and firmware. Mutating
+  setup operations are rejected outside `SETUP`; partial all-node writes are
+  reported rather than hidden.
+
+**Exit criterion:** an already commissioned connected parcours can be
+configured and validated through the browser without serial commands.
+
+#### 4.5 Game interface
+
+- Add player-name entry, clear `WAIT_START` and `WAIT_FINISH` indication, live
+  raw time, interruptions, penalty, score, recent attempts, and Top 10.
+- Show blocked-start progress and faults, and provide abort and return-to-Setup
+  controls.
+- Preserve the initial single-player-name workflow; there is no player queue.
+- Poll the small `/api/game` resource while this page is open. Refresh result
+  resources after a run finishes instead of continuously polling all APIs.
+
+**Exit criterion:** the operator can run repeated complete games without serial
+access.
+
+#### 4.6 Browser time synchronization
+
+- Accept UTC time and local UTC offset from the browser and associate them with
+  the controller monotonic clock.
+- Mark results completed before synchronization as `time unknown`; reconnecting
+  may affect only future results.
+- Add completion timestamps to stored results and migrate the Top-10 storage
+  format without losing valid version-1 scores.
+
+**Exit criterion:** new results show correct client-derived timestamps, and
+persisted Top-10 timestamps survive a controller restart.
+
+#### 4.7 Wi-Fi configuration
+
+- Display the active SSID and password and validate changes before saving them
+  to `/controller.dat`.
+- Require explicit confirmation, save before restarting the AP, and show
+  reconnection instructions before disconnecting the browser.
+- Provide a local way to restore documented factory network defaults.
+
+**Exit criterion:** credentials can be changed and survive restart, the operator
+can reconnect, and factory recovery prevents permanent loss of access.
+
+#### 4.8 Robustness and final validation
+
+- Test browser disconnect/reconnect, controller restart, bus faults during HTTP
+  requests, multiple tabs, malformed and oversized input, and long-running SSE.
+- Exercise the maximum supported inventory while serving live updates and
+  measure timing and polling behavior under simultaneous web and bus load.
+- Verify that incomplete or invalid web commands never partially change system
+  state.
+
+**Exit criterion:** one operator PC can configure the currently connected
+parcours and operate repeated full games without serial access, while failures
+remain recoverable and do not compromise game timing.
 
 ### 5. Local UI and Integration
 

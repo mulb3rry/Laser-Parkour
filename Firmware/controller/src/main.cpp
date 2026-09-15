@@ -14,6 +14,7 @@
 #include "laser_protocol.h"
 #include "laser_result_store.h"
 #include "laser_top_storage.h"
+#include "controller_web.h"
 
 namespace {
 
@@ -59,6 +60,10 @@ struct NodeInventoryEntry {
   uint16_t bootCounter;
   uint16_t eventCounter;
   uint16_t statusFlags;
+  lp_diagnostics_register_t diagnostics;
+  lp_sensor_config_register_t sensorConfig;
+  bool diagnosticsValid;
+  bool sensorConfigValid;
   bool baselineValid;
   bool available;
 };
@@ -80,6 +85,8 @@ uint32_t pollCycles = 0;
 uint32_t lastPollDurationUs = 0;
 uint32_t maximumPollDurationUs = 0;
 uint32_t lastPollMs = 0;
+uint32_t lastWebDetailRefreshMs = 0U;
+uint8_t nextWebDetailIndex = 0U;
 uint8_t nodeAddress = LP_ADDRESS_COMMISSIONING;
 uint8_t commandSequence = 0U;
 volatile bool fuEdgePending = false;
@@ -137,6 +144,7 @@ ControllerLedState controllerLedState = ControllerLedState::BOOT;
 bool controllerInternalFault = false;
 bool apHealthMonitoring = false;
 bool apWebHealthy = true;
+uint32_t lastWebHealthCheckMs = 0U;
 
 enum class IdentityReadResult : uint8_t {
   OK,
@@ -599,6 +607,10 @@ void addDiscoveredNode(uint8_t address,
   entry.bootCounter = 0U;
   entry.eventCounter = 0U;
   entry.statusFlags = 0U;
+  memset(&entry.diagnostics, 0, sizeof(entry.diagnostics));
+  memset(&entry.sensorConfig, 0, sizeof(entry.sensorConfig));
+  entry.diagnosticsValid = false;
+  entry.sensorConfigValid = false;
   entry.baselineValid = false;
   entry.available = true;
 }
@@ -953,26 +965,209 @@ void printTopResults(void) {
   printStoredResults("Top scores", resultStore.top, resultStore.top_count);
 }
 
+void appendJsonString(String &output, const char *value) {
+  output += '"';
+  for (const unsigned char *cursor =
+           reinterpret_cast<const unsigned char *>(value);
+       *cursor != '\0'; ++cursor) {
+    switch (*cursor) {
+      case '"': output += F("\\\""); break;
+      case '\\': output += F("\\\\"); break;
+      case '\b': output += F("\\b"); break;
+      case '\f': output += F("\\f"); break;
+      case '\n': output += F("\\n"); break;
+      case '\r': output += F("\\r"); break;
+      case '\t': output += F("\\t"); break;
+      default:
+        if (*cursor < 0x20U) {
+          char escaped[7];
+          snprintf(escaped, sizeof(escaped), "\\u%04x", *cursor);
+          output += escaped;
+        } else {
+          output += static_cast<char>(*cursor);
+        }
+    }
+  }
+  output += '"';
+}
+
+void appendJsonUint64(String &output, uint64_t value) {
+  char decimal[21];
+  snprintf(decimal, sizeof(decimal), "%llu",
+           static_cast<unsigned long long>(value));
+  output += decimal;
+}
+
+String webSystemJson(void) {
+  String output;
+  output.reserve(256U);
+  output = F("{\"timestamp_ms\":");
+  output += millis();
+  output += F(",\"uptime_ms\":");
+  output += millis();
+  output += F(",\"web_healthy\":");
+  output += controllerWebHealthy() ? F("true") : F("false");
+  output += F(",\"internal_fault\":");
+  output += controllerInternalFault ? F("true") : F("false");
+  output += F(",\"bus_reads_ok\":"); output += successfulReads;
+  output += F(",\"bus_reads_failed\":"); output += failedReads;
+  output += F(",\"poll_cycles\":"); output += pollCycles;
+  output += F(",\"last_poll_us\":"); output += lastPollDurationUs;
+  output += F(",\"maximum_poll_us\":"); output += maximumPollDurationUs;
+  output += '}';
+  return output;
+}
+
+String webGameJson(void) {
+  const uint64_t nowUs = monotonicMicros();
+  uint64_t rawUs = 0U;
+  uint64_t scoreUs = 0U;
+  if (game.state == LP_GAME_WAIT_FINISH && nowUs >= game.start_us) {
+    rawUs = nowUs - game.start_us;
+    scoreUs = rawUs +
+        (uint64_t)game.interruptions * game.settings.penalty_ms * 1000U;
+  }
+  String output;
+  output.reserve(256U);
+  output = F("{\"timestamp_ms\":"); output += millis();
+  output += F(",\"state\":"); appendJsonString(output, lp_game_state_name(game.state));
+  output += F(",\"player\":"); appendJsonString(output, game.current_player);
+  output += F(",\"start_enabled\":");
+  output += startAcceptanceEnabled ? F("true") : F("false");
+  output += F(",\"interruptions\":"); output += game.interruptions;
+  output += F(",\"raw_time_us\":"); appendJsonUint64(output, rawUs);
+  output += F(",\"score_time_us\":"); appendJsonUint64(output, scoreUs);
+  output += '}';
+  return output;
+}
+
+void appendWebNodeJson(String &output, const NodeInventoryEntry &entry) {
+  output += F("{\"address\":"); output += entry.address;
+  output += F(",\"address_hex\":\"");
+  if (entry.address < 0x10U) output += '0';
+  output += String(entry.address, HEX); output += '"';
+  output += F(",\"role\":"); appendJsonString(output, roleName(entry.identity.role));
+  output += F(",\"available\":"); output += entry.available ? F("true") : F("false");
+  output += F(",\"boot_counter\":"); output += entry.bootCounter;
+  output += F(",\"event_counter\":"); output += entry.eventCounter;
+  output += F(",\"status_flags\":"); output += entry.statusFlags;
+  output += F(",\"protocol\":\""); output += entry.identity.protocol_major;
+  output += '.'; output += entry.identity.protocol_minor; output += '"';
+  output += F(",\"firmware\":\""); output += entry.identity.firmware_major;
+  output += '.'; output += entry.identity.firmware_minor; output += '.';
+  output += entry.identity.firmware_patch; output += '"';
+  output += F(",\"diagnostics\":");
+  if (entry.diagnosticsValid) {
+    output += F("{\"raw_adc\":"); output += lp_u16_decode(entry.diagnostics.raw_adc);
+    output += F(",\"filtered_adc\":"); output += lp_u16_decode(entry.diagnostics.filtered_adc);
+    output += F(",\"input_state\":"); output += entry.diagnostics.input_state;
+    output += F(",\"operating_mode\":"); output += entry.diagnostics.operating_mode;
+    output += F(",\"last_result\":"); output += entry.diagnostics.last_result;
+    output += F(",\"cooldown_remaining_ms\":");
+    output += lp_u16_decode(entry.diagnostics.cooldown_remaining_ms);
+    output += '}';
+  } else {
+    output += F("null");
+  }
+  output += F(",\"sensor_config\":");
+  if (entry.sensorConfigValid) {
+    output += F("{\"threshold\":"); output += lp_u16_decode(entry.sensorConfig.broken_threshold);
+    output += F(",\"hysteresis\":"); output += lp_u16_decode(entry.sensorConfig.hysteresis);
+    output += F(",\"stable_time_ms\":"); output += lp_u16_decode(entry.sensorConfig.stable_time_ms);
+    output += F(",\"cooldown_ms\":"); output += lp_u16_decode(entry.sensorConfig.cooldown_ms);
+    output += '}';
+  } else {
+    output += F("null");
+  }
+  output += '}';
+}
+
+String webNodesJson(void) {
+  String output;
+  output.reserve(128U + (size_t)inventoryCount * 180U);
+  output = F("{\"timestamp_ms\":"); output += millis();
+  output += F(",\"selected_address\":"); output += nodeAddress;
+  output += F(",\"count\":"); output += inventoryCount;
+  output += F(",\"nodes\":[");
+  for (uint8_t index = 0U; index < inventoryCount; ++index) {
+    if (index != 0U) output += ',';
+    appendWebNodeJson(output, inventory[index]);
+  }
+  output += F("]}");
+  return output;
+}
+
+String webNodeJson(uint8_t address) {
+  const int8_t index = inventoryIndexForAddress(address);
+  if (index < 0) return String();
+  String output;
+  output.reserve(220U);
+  appendWebNodeJson(output, inventory[index]);
+  return output;
+}
+
+String webResultsJson(const lp_stored_result_t *entries, uint8_t count) {
+  String output;
+  output.reserve(64U + (size_t)count * 180U);
+  output = F("{\"timestamp_ms\":"); output += millis();
+  output += F(",\"count\":"); output += count; output += F(",\"results\":[");
+  for (uint8_t index = 0U; index < count; ++index) {
+    if (index != 0U) output += ',';
+    const lp_stored_result_t &entry = entries[index];
+    output += F("{\"sequence\":"); appendJsonUint64(output, entry.completion_sequence);
+    output += F(",\"status\":"); output += static_cast<unsigned int>(entry.result.status);
+    output += F(",\"player\":"); appendJsonString(output, entry.result.player);
+    output += F(",\"raw_time_us\":"); appendJsonUint64(output, entry.result.raw_time_us);
+    output += F(",\"interruptions\":"); output += entry.result.interruptions;
+    output += F(",\"penalty_time_us\":"); appendJsonUint64(output, entry.result.penalty_time_us);
+    output += F(",\"score_time_us\":"); appendJsonUint64(output, entry.result.score_time_us);
+    output += '}';
+  }
+  output += F("]}");
+  return output;
+}
+
+String webRecentResultsJson(void) {
+  return webResultsJson(resultStore.recent, resultStore.recent_count);
+}
+
+String webTopResultsJson(void) {
+  return webResultsJson(resultStore.top, resultStore.top_count);
+}
+
+String webSettingsJson(void) {
+  String output;
+  output.reserve(240U);
+  output = F("{\"penalty_ms\":"); output += controllerConfig.penalty_ms;
+  output += F(",\"maximum_run_ms\":"); output += controllerConfig.maximum_run_ms;
+  output += F(",\"wifi_country\":"); appendJsonString(output, controllerConfig.wifi_country);
+  output += F(",\"wifi_ssid\":"); appendJsonString(output, controllerConfig.wifi_ssid);
+  output += F(",\"wifi_password\":"); appendJsonString(output, controllerConfig.wifi_password);
+  output += '}';
+  return output;
+}
+
 void requestTopResultsClear(void) {
   pendingTopResultsClear = true;
   Serial.println("Do you really want to clear the complete Top 10? (y/N)");
 }
 
-void clearTopResults(void) {
+bool clearTopResults(void) {
   if (!resultFilesystemReady) {
     Serial.println("TOP-10 STORAGE ERROR: LittleFS is unavailable; list not cleared");
-    return;
+    return false;
   }
   if (LittleFS.exists(TOP_RESULTS_PATH) &&
       !LittleFS.remove(TOP_RESULTS_PATH)) {
     controllerInternalFault = true;
     updateControllerLed();
     Serial.println("TOP-10 STORAGE ERROR: file could not be removed; list not cleared");
-    return;
+    return false;
   }
   memset(resultStore.top, 0, sizeof(resultStore.top));
   resultStore.top_count = 0U;
   Serial.println("Top 10 cleared; recent attempts were retained");
+  return true;
 }
 
 void printGameStatus(void) {
@@ -1603,6 +1798,229 @@ void stageSensorConfig(const SensorConfigValues &values) {
   }
 }
 
+bool webWriteSensorConfiguration(uint8_t address,
+                                 const SensorConfigValues &values) {
+  const int8_t index = inventoryIndexForAddress(address);
+  if (index < 0 || inventory[index].identity.role != LP_ROLE_LASER ||
+      !inventory[index].available) return false;
+  if (values.threshold > LP_SENSOR_THRESHOLD_MAX ||
+      values.hysteresis > LP_SENSOR_HYSTERESIS_MAX ||
+      values.hysteresis > values.threshold ||
+      values.stableTimeMs > LP_SENSOR_STABLE_TIME_MAX_MS ||
+      values.cooldownMs > LP_SENSOR_COOLDOWN_MAX_MS) {
+    Serial.println();
+    Serial.println("WEB: rejected invalid sensor configuration");
+    return false;
+  }
+  Serial.println();
+  Serial.print("WEB: configuring laser node 0x");
+  Serial.print(address, HEX);
+  Serial.print(" (threshold="); Serial.print(values.threshold);
+  Serial.print(", hysteresis="); Serial.print(values.hysteresis);
+  Serial.print(", stable="); Serial.print(values.stableTimeMs);
+  Serial.print(" ms, cooldown="); Serial.print(values.cooldownMs);
+  Serial.println(" ms)");
+  const uint8_t selected = nodeAddress;
+  nodeAddress = address;
+  lp_sensor_config_register_t config{
+      .broken_threshold = lp_u16_encode(values.threshold),
+      .hysteresis = lp_u16_encode(values.hysteresis),
+      .stable_time_ms = lp_u16_encode(values.stableTimeMs),
+      .cooldown_ms = lp_u16_encode(values.cooldownMs), .crc8 = 0U};
+  config.crc8 = lp_register_crc8(
+      LP_REGISTER_STAGED_SENSOR_CONFIG,
+      reinterpret_cast<const uint8_t *>(&config), sizeof(config) - 1U);
+  if (!writeRegisterBlock(LP_REGISTER_STAGED_SENSOR_CONFIG,
+                          reinterpret_cast<const uint8_t *>(&config),
+                          sizeof(config))) {
+    Serial.print("WEB: sensor staging failed, Wire result=");
+    Serial.println(lastWireWriteResult);
+    nodeAddress = selected;
+    return false;
+  }
+  delay(30);
+  lp_sensor_config_register_t staged{};
+  if (!readSensorConfig(LP_REGISTER_STAGED_SENSOR_CONFIG, staged) ||
+      memcmp(&config, &staged, sizeof(config)) != 0) {
+    Serial.println("WEB: staged sensor configuration did not read back correctly");
+    nodeAddress = selected;
+    return false;
+  }
+  const uint8_t arguments[4] = {0U, 0U, 0U, 0U};
+  lp_command_result_register_t result{};
+  if (!sendCommand(LP_COMMAND_SAVE_CONFIG, arguments, result)) {
+    Serial.println("WEB: SAVE_CONFIG timed out or failed on I2C");
+    nodeAddress = selected;
+    return false;
+  }
+  if (result.result != LP_RESULT_OK) {
+    Serial.print("WEB: SAVE_CONFIG rejected, result=");
+    Serial.println(result.result);
+    nodeAddress = selected;
+    return false;
+  }
+  delay(20);
+  lp_sensor_config_register_t active{};
+  // ACTIVE_SENSOR_CONFIG has a different CRC byte because register addresses
+  // are part of the CRC. Compare the four configuration fields only.
+  const bool ok = readSensorConfig(LP_REGISTER_ACTIVE_SENSOR_CONFIG, active) &&
+                  memcmp(&config, &active, sizeof(config) - 1U) == 0;
+  nodeAddress = selected;
+  if (ok) {
+    inventory[index].sensorConfig = active;
+    inventory[index].sensorConfigValid = true;
+    Serial.print("WEB: laser node 0x");
+    Serial.print(address, HEX);
+    Serial.println(" configuration saved and verified");
+  } else {
+    Serial.println("WEB: active sensor configuration did not verify");
+  }
+  return ok;
+}
+
+int webRequireSetup(String &response) {
+  if (game.state == LP_GAME_SETUP) return 0;
+  response = F("{\"error\":\"setup_required\",\"message\":\"Return the system to Setup first\"}");
+  return 409;
+}
+
+int webSetSetupMode(String &response) {
+  returnGameToSetup();
+  response = F("{\"ok\":true,\"message\":\"System returned to Setup\"}");
+  return 200;
+}
+
+int webSetGameMode(String &response) {
+  if (game.state != LP_GAME_SETUP) {
+    response = F("{\"error\":\"already_in_game\",\"message\":\"Game mode is already active\"}");
+    return 409;
+  }
+  enterGameReady();
+  const bool ok = game.state == LP_GAME_WAIT_PLAYER;
+  response = ok ? F("{\"ok\":true,\"message\":\"Game mode started\"}")
+                : F("{\"error\":\"game_start_failed\",\"message\":\"Node validation failed; check system status\"}");
+  return ok ? 200 : 409;
+}
+
+int webRescanNodes(String &response) {
+  if (const int denied = webRequireSetup(response)) return denied;
+  const bool found = discoverNode();
+  if (found) {
+    pollInventory();
+    (void)validateInventory();
+  }
+  response = String(F("{\"ok\":")) + (found ? "true" : "false") +
+             F(",\"message\":\"") +
+             (found ? "Node rescan complete" : "No valid nodes discovered") +
+             F("\",\"count\":") + inventoryCount + '}';
+  return found ? 200 : 409;
+}
+
+int webSaveSettings(uint32_t penaltyMs, uint32_t maximumRunMs,
+                    const char *ssid, const char *password, String &response) {
+  if (const int denied = webRequireSetup(response)) return denied;
+  lp_controller_config_t candidate = controllerConfig;
+  candidate.penalty_ms = penaltyMs;
+  candidate.maximum_run_ms = maximumRunMs;
+  if (strlen(ssid) > LP_CONFIG_SSID_BYTES ||
+      strlen(password) > LP_CONFIG_PASSWORD_BYTES) {
+    response = F("{\"error\":\"invalid_settings\",\"message\":\"SSID or password is too long\"}");
+    return 400;
+  }
+  strcpy(candidate.wifi_ssid, ssid);
+  strcpy(candidate.wifi_password, password);
+  if (!lp_controller_config_valid(&candidate)) {
+    response = F("{\"error\":\"invalid_settings\",\"message\":\"SSID must not be empty and password must contain 8-63 characters\"}");
+    return 400;
+  }
+  const lp_controller_config_t previous = controllerConfig;
+  controllerConfig = candidate;
+  if (!saveControllerConfiguration()) {
+    controllerConfig = previous;
+    response = F("{\"error\":\"storage_failure\",\"message\":\"Configuration could not be saved\"}");
+    return 500;
+  }
+  game.settings.penalty_ms = penaltyMs;
+  game.settings.maximum_run_ms = maximumRunMs;
+  Serial.println();
+  Serial.print("WEB: controller configuration saved (penalty=");
+  Serial.print(penaltyMs);
+  Serial.print(" ms, maximum run=");
+  Serial.print(maximumRunMs);
+  Serial.print(" ms, SSID=");
+  Serial.print(controllerConfig.wifi_ssid);
+  Serial.println(")");
+  response = F("{\"ok\":true,\"message\":\"Configuration saved; restart to apply changed Wi-Fi credentials\"}");
+  return 200;
+}
+
+int webConfigureSensor(uint8_t address, uint16_t threshold,
+                       uint16_t hysteresis, uint16_t stableTimeMs,
+                       uint16_t cooldownMs, String &response) {
+  if (const int denied = webRequireSetup(response)) return denied;
+  if (threshold > LP_SENSOR_THRESHOLD_MAX ||
+      hysteresis > LP_SENSOR_HYSTERESIS_MAX || hysteresis > threshold ||
+      stableTimeMs > LP_SENSOR_STABLE_TIME_MAX_MS ||
+      cooldownMs > LP_SENSOR_COOLDOWN_MAX_MS) {
+    response = F("{\"error\":\"invalid_sensor_config\",\"message\":\"Threshold/hysteresis must be 0-1023, hysteresis cannot exceed threshold, stable time is limited to 1000 ms, and cooldown to 5000 ms\"}");
+    Serial.println();
+    Serial.println("WEB: rejected invalid sensor configuration");
+    return 400;
+  }
+  const int8_t index = inventoryIndexForAddress(address);
+  if (index < 0) {
+    response = F("{\"error\":\"node_not_found\"}"); return 404;
+  }
+  if (inventory[index].identity.role != LP_ROLE_LASER) {
+    response = F("{\"error\":\"wrong_role\",\"message\":\"Sensor configuration is only valid for laser nodes\"}");
+    return 400;
+  }
+  const bool ok = webWriteSensorConfiguration(
+      address, {threshold, hysteresis, stableTimeMs, cooldownMs});
+  response = ok ? F("{\"ok\":true,\"message\":\"Sensor configuration saved\"}")
+                : F("{\"error\":\"node_write_failed\",\"message\":\"The node did not accept or verify the configuration\"}");
+  return ok ? 200 : 503;
+}
+
+int webConfigureAllSensors(uint16_t threshold, uint16_t hysteresis,
+                           uint16_t stableTimeMs, uint16_t cooldownMs,
+                           String &response) {
+  if (const int denied = webRequireSetup(response)) return denied;
+  uint8_t attempted = 0U, saved = 0U;
+  const SensorConfigValues values{threshold, hysteresis, stableTimeMs,
+                                  cooldownMs};
+  for (uint8_t i = 0U; i < inventoryCount; ++i) {
+    if (inventory[i].identity.role != LP_ROLE_LASER) continue;
+    ++attempted;
+    if (webWriteSensorConfiguration(inventory[i].address, values)) ++saved;
+  }
+  response = String(F("{\"ok\":")) +
+             (attempted != 0U && attempted == saved ? "true" : "false") +
+             F(",\"message\":\"") + String(saved) + F(" of ") +
+             String(attempted) + F(" laser configurations saved\",\"saved\":") +
+             saved + F(",\"attempted\":") + attempted + '}';
+  return attempted != 0U && attempted == saved ? 200 : 503;
+}
+
+int webIdentifyNode(uint8_t address, String &response) {
+  if (const int denied = webRequireSetup(response)) return denied;
+  const int8_t index = inventoryIndexForAddress(address);
+  if (index < 0) { response = F("{\"error\":\"node_not_found\"}"); return 404; }
+  const uint8_t arguments[4] = {0U, 0U, 0U, 0U};
+  const bool ok = sendCommandToNode(address, LP_COMMAND_IDENTIFY, arguments);
+  response = ok ? F("{\"ok\":true,\"message\":\"Identify indication started for 4 seconds\"}")
+                : F("{\"error\":\"identify_failed\"}");
+  return ok ? 200 : 503;
+}
+
+int webClearTopResults(String &response) {
+  if (const int denied = webRequireSetup(response)) return denied;
+  const bool ok = clearTopResults();
+  response = ok ? F("{\"ok\":true,\"message\":\"Top 10 cleared\"}")
+                : F("{\"error\":\"storage_failure\"}");
+  return ok ? 200 : 500;
+}
+
 bool readWithRetries(lp_fast_status_register_t &status) {
   for (uint8_t attempt = 0U; attempt < 3U; ++attempt) {
     if (readFastStatus(status)) {
@@ -1743,6 +2161,36 @@ void pollInventory(void) {
     maximumPollDurationUs = lastPollDurationUs;
   }
   ++pollCycles;
+}
+
+void refreshWebNodeDetailCache(void) {
+  if (inventoryCount == 0U || millis() - lastWebDetailRefreshMs < 250U) {
+    return;
+  }
+  lastWebDetailRefreshMs = millis();
+  if (nextWebDetailIndex >= inventoryCount) {
+    nextWebDetailIndex = 0U;
+  }
+  NodeInventoryEntry &entry = inventory[nextWebDetailIndex++];
+  if (!entry.available) {
+    entry.diagnosticsValid = false;
+    return;
+  }
+  const uint8_t selected = nodeAddress;
+  nodeAddress = entry.address;
+  lp_diagnostics_register_t diagnostics{};
+  if (readNodeDiagnostics(diagnostics)) {
+    entry.diagnostics = diagnostics;
+    entry.diagnosticsValid = true;
+  }
+  if (entry.identity.role == LP_ROLE_LASER && !entry.sensorConfigValid) {
+    lp_sensor_config_register_t config{};
+    if (readSensorConfig(LP_REGISTER_ACTIVE_SENSOR_CONFIG, config)) {
+      entry.sensorConfig = config;
+      entry.sensorConfigValid = true;
+    }
+  }
+  nodeAddress = selected;
 }
 
 void correlateFuEdge(void) {
@@ -2424,6 +2872,33 @@ void setup() {
       .maximum_run_ms = controllerConfig.maximum_run_ms,
   };
   lp_game_init(&game, gameSettings);
+  apHealthMonitoring = true;
+  const ControllerWebDataSource webDataSource = {
+      .systemJson = webSystemJson,
+      .gameJson = webGameJson,
+      .nodesJson = webNodesJson,
+      .nodeJson = webNodeJson,
+      .recentResultsJson = webRecentResultsJson,
+      .topResultsJson = webTopResultsJson,
+      .settingsJson = webSettingsJson,
+  };
+  const ControllerWebActions webActions = {
+      .setSetupMode = webSetSetupMode,
+      .setGameMode = webSetGameMode,
+      .rescanNodes = webRescanNodes,
+      .saveSettings = webSaveSettings,
+      .configureSensor = webConfigureSensor,
+      .configureAllSensors = webConfigureAllSensors,
+      .identifyNode = webIdentifyNode,
+      .clearTopResults = webClearTopResults,
+  };
+  apWebHealthy = controllerWebBegin(controllerConfig, webDataSource,
+                                    webActions);
+  if (apWebHealthy) {
+    controllerWebPrintStatus();
+  } else {
+    Serial.println("ERROR: Wi-Fi access point or HTTP server failed to start");
+  }
   (void)monotonicMicros();
   if (discoverNode()) {
     printInventory();
@@ -2436,6 +2911,17 @@ void setup() {
 
 void loop() {
   const uint64_t nowUs = monotonicMicros();
+  controllerWebHandle();
+  if (millis() - lastWebHealthCheckMs >= 1000U) {
+    lastWebHealthCheckMs = millis();
+    const bool healthy = controllerWebHealthy();
+    if (healthy != apWebHealthy) {
+      apWebHealthy = healthy;
+      Serial.println(healthy ? "Web interface recovered"
+                             : "ERROR: Wi-Fi access point stopped");
+      updateControllerLed();
+    }
+  }
   handleSerialInput();
   updateSound();
   handleFuEdge();
@@ -2450,6 +2936,7 @@ void loop() {
     lastPollMs = millis();
     pollInventory();
   }
+  refreshWebNodeDetailCache();
   updateStartReadiness();
   updateControllerLed();
 }
