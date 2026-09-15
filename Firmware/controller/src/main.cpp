@@ -118,6 +118,10 @@ uint8_t playerInputLength = 0U;
 uint32_t monotonicMicrosLow = 0U;
 uint64_t monotonicMicrosHigh = 0U;
 uint64_t fuGameTimestampUs = 0U;
+bool timeSynchronizationValid = false;
+uint64_t synchronizedUnixMs = 0U;
+uint64_t synchronizedMonotonicUs = 0U;
+int16_t synchronizedUtcOffsetMinutes = 0;
 bool startAcceptanceEnabled = false;
 bool startClearTimerActive = false;
 uint32_t startClearSinceMs = 0U;
@@ -918,6 +922,18 @@ void initializeResultStorage(void) {
 }
 
 void recordAndPrintGameResult(void) {
+  game.last_result.timestamp_valid = false;
+  game.last_result.completion_unix_s = 0U;
+  game.last_result.utc_offset_minutes = 0;
+  if (timeSynchronizationValid &&
+      game.last_result.end_us >= synchronizedMonotonicUs) {
+    const uint64_t elapsedMs =
+        (game.last_result.end_us - synchronizedMonotonicUs) / 1000U;
+    game.last_result.completion_unix_s =
+        (synchronizedUnixMs + elapsedMs) / 1000U;
+    game.last_result.utc_offset_minutes = synchronizedUtcOffsetMinutes;
+    game.last_result.timestamp_valid = true;
+  }
   const uint8_t previousTopCount = resultStore.top_count;
   lp_stored_result_t previousTop[LP_RESULT_STORE_CAPACITY];
   memcpy(previousTop, resultStore.top, sizeof(previousTop));
@@ -1121,6 +1137,12 @@ String webResultsJson(const lp_stored_result_t *entries, uint8_t count) {
     output += F(",\"interruptions\":"); output += entry.result.interruptions;
     output += F(",\"penalty_time_us\":"); appendJsonUint64(output, entry.result.penalty_time_us);
     output += F(",\"score_time_us\":"); appendJsonUint64(output, entry.result.score_time_us);
+    output += F(",\"timestamp_valid\":");
+    output += entry.result.timestamp_valid ? F("true") : F("false");
+    output += F(",\"completion_unix_s\":");
+    appendJsonUint64(output, entry.result.completion_unix_s);
+    output += F(",\"utc_offset_minutes\":");
+    output += entry.result.utc_offset_minutes;
     output += '}';
   }
   output += F("]}");
@@ -2082,6 +2104,20 @@ int webResetLaserCounters(String &response) {
   return attempted != 0U && reset == attempted ? 200 : 503;
 }
 
+int webSynchronizeTime(uint64_t unixMs, int16_t utcOffsetMinutes,
+                       String &response) {
+  synchronizedMonotonicUs = monotonicMicros();
+  synchronizedUnixMs = unixMs;
+  synchronizedUtcOffsetMinutes = utcOffsetMinutes;
+  timeSynchronizationValid = true;
+  Serial.println();
+  Serial.print("WEB: time synchronized, UTC offset=");
+  Serial.print(utcOffsetMinutes);
+  Serial.println(" minutes");
+  response = F("{\"ok\":true}");
+  return 200;
+}
+
 bool readWithRetries(lp_fast_status_register_t &status) {
   for (uint8_t attempt = 0U; attempt < 3U; ++attempt) {
     if (readFastStatus(status)) {
@@ -2954,6 +2990,7 @@ void setup() {
       .clearTopResults = webClearTopResults,
       .submitPlayer = webSubmitPlayer,
       .resetLaserCounters = webResetLaserCounters,
+      .synchronizeTime = webSynchronizeTime,
   };
   apWebHealthy = controllerWebBegin(controllerConfig, webDataSource,
                                     webActions);

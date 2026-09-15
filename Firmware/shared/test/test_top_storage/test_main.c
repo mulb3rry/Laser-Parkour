@@ -16,6 +16,9 @@ static lp_game_result_t result(const char *player, uint64_t score_us) {
   value.penalty_time_us = 50U;
   value.score_time_us = score_us;
   value.interruptions = 2U;
+  value.completion_unix_s = 1760000000U;
+  value.utc_offset_minutes = 120;
+  value.timestamp_valid = true;
   return value;
 }
 
@@ -35,6 +38,11 @@ static void test_round_trip_restores_top_but_not_recent(void) {
   TEST_ASSERT_EQUAL_UINT8(0U, restored.recent_count);
   TEST_ASSERT_EQUAL_STRING("Ben", restored.top[0].result.player);
   TEST_ASSERT_EQUAL_UINT64(900U, restored.top[0].result.score_time_us);
+  TEST_ASSERT_TRUE(restored.top[0].result.timestamp_valid);
+  TEST_ASSERT_EQUAL_UINT64(1760000000U,
+                           restored.top[0].result.completion_unix_s);
+  TEST_ASSERT_EQUAL_INT16(120,
+                          restored.top[0].result.utc_offset_minutes);
   TEST_ASSERT_EQUAL_UINT64(original.next_completion_sequence,
                            restored.next_completion_sequence);
 }
@@ -57,7 +65,7 @@ static void test_wrong_size_and_version_are_rejected(void) {
   TEST_ASSERT_TRUE(lp_top_storage_encode(&original, encoded, sizeof(encoded)));
   TEST_ASSERT_FALSE(
       lp_top_storage_decode(&original, encoded, sizeof(encoded) - 1U));
-  encoded[4] = 2U;
+  encoded[4] = 1U;
   TEST_ASSERT_FALSE(lp_top_storage_decode(&original, encoded, sizeof(encoded)));
 }
 

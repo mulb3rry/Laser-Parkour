@@ -48,6 +48,9 @@ typedef struct {
   uint64_t penalty_time_us;
   uint64_t score_time_us;
   uint32_t interruptions;
+  uint64_t completion_unix_s;
+  int16_t utc_offset_minutes;
+  bool timestamp_valid;
 } lp_game_result_t;
 
 typedef struct {

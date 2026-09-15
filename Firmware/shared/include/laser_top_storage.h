@@ -11,8 +11,8 @@
 extern "C" {
 #endif
 
-#define LP_TOP_STORAGE_FORMAT_VERSION 1U
-#define LP_TOP_STORAGE_ENCODED_SIZE 880U
+#define LP_TOP_STORAGE_FORMAT_VERSION 2U
+#define LP_TOP_STORAGE_ENCODED_SIZE 990U
 
 bool lp_top_storage_encode(const lp_result_store_t *store, uint8_t *output,
                            size_t output_size);

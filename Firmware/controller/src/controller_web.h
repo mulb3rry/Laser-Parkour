@@ -32,6 +32,8 @@ struct ControllerWebActions {
   int (*clearTopResults)(String &response);
   int (*submitPlayer)(const char *name, String &response);
   int (*resetLaserCounters)(String &response);
+  int (*synchronizeTime)(uint64_t unixMs, int16_t utcOffsetMinutes,
+                         String &response);
 };
 
 bool controllerWebBegin(const lp_controller_config_t &config,

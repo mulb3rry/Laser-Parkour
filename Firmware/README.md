@@ -967,12 +967,17 @@ access.
 
 #### 4.6 Browser time synchronization
 
-- Accept UTC time and local UTC offset from the browser and associate them with
-  the controller monotonic clock.
-- Mark results completed before synchronization as `time unknown`; reconnecting
-  may affect only future results.
-- Add completion timestamps to stored results and migrate the Top-10 storage
-  format without losing valid version-1 scores.
+- `/setup` and `/game` send Unix time and the client's current UTC offset when
+  opened and every five minutes. The controller anchors these values to its
+  monotonic clock; run timing remains independent of browser time.
+- Every new recent and Top-10 result stores its completion time and UTC offset.
+  Results completed without a valid anchor are marked `Time unknown`.
+- Both game-page lists have a `Completed` column displaying `HH:mm` for today,
+  `Yesterday HH:mm` for the previous day, and `DD.MM. HH:mm` for older results.
+  The prominent latest-result panel omits this timestamp, and the year is
+  deliberately not displayed.
+- Top-10 storage format 2 contains the timestamp fields. Version 1 and unknown
+  formats are discarded instead of migrated.
 
 **Exit criterion:** new results show correct client-derived timestamps, and
 persisted Top-10 timestamps survive a controller restart.
