@@ -928,10 +928,12 @@ the diagnostic dashboard remains available only at `/debug`.
   write EEPROM. Polling pauses during configuration writes. The compact
   inventory refreshes every two seconds; slower-changing system status is
   refreshed every ten seconds. Each node line has separate type, input-state,
-  and availability columns, an Info button for versions, ADC readings,
+  event-counter, and availability columns. A counter that increased since the
+  previous refresh flashes red. Each line also has an Info button for versions, ADC readings,
   counters and active settings, and—on laser nodes—a Configure button. The
   common configuration section reports whether all discovered lasers use the
-  same active values and warns if values differ or cannot be read.
+  same active values and warns if values differ or cannot be read. A confirmed
+  setup-only action resets the event counters of all discovered laser nodes.
 - Each discovered node has an Identify action. Node commissioning remains an
   intentionally CLI-only operation.
 - All values are validated by both browser controls and firmware. Mutating
@@ -946,6 +948,9 @@ configured and validated through the browser without serial commands.
 - The responsive `/game` dashboard provides player-name entry enabled only in
   `WAIT_PLAYER`, a compact state-machine indicator, current interruption count,
   a prominent latest-result summary, and ten-row Top 10 and recent-run tables.
+- Player names contain 1-32 ASCII letters, numbers, dashes, underscores, or
+  spaces; a space cannot be the first or last character. Browser and firmware
+  both enforce the rule.
 - The controller remains the authoritative timer. The browser deliberately
   shows no simulated live clock; final raw time, penalty, and score appear only
   after the controller records a result.

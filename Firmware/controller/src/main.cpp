@@ -2027,8 +2027,18 @@ int webSubmitPlayer(const char *name, String &response) {
     response = F("{\"error\":\"wrong_state\",\"message\":\"The game is not accepting a player name\"}");
     return 409;
   }
-  if (name == nullptr || strlen(name) > LP_GAME_PLAYER_NAME_BYTES) {
-    response = F("{\"error\":\"invalid_name\",\"message\":\"Enter a non-blank name of at most 32 characters\"}");
+  const size_t length = name == nullptr ? 0U : strlen(name);
+  bool valid = length != 0U && length <= LP_GAME_PLAYER_NAME_BYTES &&
+               name[0] != ' ' && name[length - 1U] != ' ';
+  for (size_t index = 0U; valid && index < length; ++index) {
+    const char value = name[index];
+    valid = (value >= 'A' && value <= 'Z') ||
+            (value >= 'a' && value <= 'z') ||
+            (value >= '0' && value <= '9') || value == ' ' || value == '-' ||
+            value == '_';
+  }
+  if (!valid) {
+    response = F("{\"error\":\"invalid_name\",\"message\":\"Use 1-32 ASCII letters, numbers, spaces, dashes, or underscores; spaces cannot be first or last\"}");
     return 400;
   }
   Serial.println();
@@ -2037,11 +2047,39 @@ int webSubmitPlayer(const char *name, String &response) {
   if (!armPlayer(name)) {
     response = game.state == LP_GAME_FAULT
                    ? F("{\"error\":\"preparation_failed\",\"message\":\"Player preparation failed; check the nodes\"}")
-                   : F("{\"error\":\"invalid_name\",\"message\":\"Enter a non-blank name of at most 32 characters\"}");
+                   : F("{\"error\":\"invalid_name\",\"message\":\"Use 1-32 ASCII letters, numbers, spaces, dashes, or underscores\"}");
     return game.state == LP_GAME_FAULT ? 503 : 400;
   }
   response = F("{\"ok\":true,\"message\":\"Player accepted; waiting for Start\"}");
   return 200;
+}
+
+int webResetLaserCounters(String &response) {
+  if (const int denied = webRequireSetup(response)) return denied;
+  uint8_t attempted = 0U, reset = 0U;
+  Serial.println();
+  Serial.println("WEB: resetting all laser event counters");
+  for (uint8_t index = 0U; index < inventoryCount; ++index) {
+    NodeInventoryEntry &entry = inventory[index];
+    if (entry.identity.role != LP_ROLE_LASER) continue;
+    ++attempted;
+    const uint16_t token = static_cast<uint16_t>(millis() + index);
+    const uint8_t arguments[4] = {
+        static_cast<uint8_t>(token), static_cast<uint8_t>(token >> 8U),
+        0U, 0U};
+    if (sendCommandToNode(entry.address, LP_COMMAND_RESET_COUNTER, arguments)) {
+      entry.eventCounter = 0U;
+      entry.baselineValid = false;
+      ++reset;
+    }
+  }
+  Serial.print("WEB: reset "); Serial.print(reset); Serial.print(" of ");
+  Serial.print(attempted); Serial.println(" laser event counters");
+  response = String(F("{\"ok\":")) +
+             (attempted != 0U && reset == attempted ? "true" : "false") +
+             F(",\"message\":\"") + reset + F(" of ") + attempted +
+             F(" laser event counters reset\"}");
+  return attempted != 0U && reset == attempted ? 200 : 503;
 }
 
 bool readWithRetries(lp_fast_status_register_t &status) {
@@ -2915,6 +2953,7 @@ void setup() {
       .identifyNode = webIdentifyNode,
       .clearTopResults = webClearTopResults,
       .submitPlayer = webSubmitPlayer,
+      .resetLaserCounters = webResetLaserCounters,
   };
   apWebHealthy = controllerWebBegin(controllerConfig, webDataSource,
                                     webActions);
