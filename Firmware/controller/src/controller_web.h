@@ -30,6 +30,7 @@ struct ControllerWebActions {
                              String &response);
   int (*identifyNode)(uint8_t address, String &response);
   int (*clearTopResults)(String &response);
+  int (*submitPlayer)(const char *name, String &response);
 };
 
 bool controllerWebBegin(const lp_controller_config_t &config,

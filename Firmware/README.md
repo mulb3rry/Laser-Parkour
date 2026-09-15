@@ -943,13 +943,19 @@ configured and validated through the browser without serial commands.
 
 #### 4.5 Game interface
 
-- Add player-name entry, clear `WAIT_START` and `WAIT_FINISH` indication, live
-  raw time, interruptions, penalty, score, recent attempts, and Top 10.
-- Show blocked-start progress and faults, and provide abort and return-to-Setup
-  controls.
-- Preserve the initial single-player-name workflow; there is no player queue.
-- Poll the small `/api/game` resource while this page is open. Refresh result
-  resources after a run finishes instead of continuously polling all APIs.
+- The responsive `/game` dashboard provides player-name entry enabled only in
+  `WAIT_PLAYER`, a compact state-machine indicator, current interruption count,
+  a prominent latest-result summary, and ten-row Top 10 and recent-run tables.
+- The controller remains the authoritative timer. The browser deliberately
+  shows no simulated live clock; final raw time, penalty, and score appear only
+  after the controller records a result.
+- The small `/api/game` resource is polled every 750 ms. Result resources load
+  once when the page opens and again only when the state returns to
+  `WAIT_PLAYER`.
+- The layout fits standard 16:9 laptop and Full HD displays without scrolling,
+  while narrower screens stack sections and permit scrolling. A confirmed
+  Return-to-Setup action changes mode and replaces the browser history entry.
+- The initial single-player-name workflow is preserved; there is no queue.
 
 **Exit criterion:** the operator can run repeated complete games without serial
 access.

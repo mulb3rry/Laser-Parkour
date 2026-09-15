@@ -1347,10 +1347,10 @@ void enterGameReady(void) {
   Serial.println("Game is waiting for a player name; use jNAME");
 }
 
-void armPlayer(const char *player) {
+bool armPlayer(const char *player) {
   if (game.state != LP_GAME_WAIT_PLAYER) {
     Serial.println("Cannot accept player: game is not waiting for a name");
-    return;
+    return false;
   }
   bool nonBlank = false;
   for (const char *character = player; *character != '\0'; ++character) {
@@ -1360,13 +1360,13 @@ void armPlayer(const char *player) {
   }
   if (!nonBlank) {
     Serial.println("Cannot arm player: name is blank");
-    return;
+    return false;
   }
   const lp_game_action_result_t result = lp_game_set_player(&game, player);
   if (result != LP_GAME_OK) {
     Serial.print("Cannot accept player, result=");
     Serial.println(result);
-    return;
+    return false;
   }
   if (!setLaserNodeModes(LP_MODE_SETUP) || !resetAndVerifyAllCounters() ||
       !setLaserNodeModes(LP_MODE_GAME) ||
@@ -1376,7 +1376,7 @@ void armPlayer(const char *player) {
     (void)setAllNodeModes(LP_MODE_SETUP);
     playSound(SOUND_FAULT);
     Serial.println("Player preparation failed; game entered FAULT");
-    return;
+    return false;
   }
   startAcceptanceEnabled = inventoryReadyForGame(true) && allLaserCountersZero();
   startClearTimerActive = false;
@@ -1385,7 +1385,7 @@ void armPlayer(const char *player) {
                                     : LP_BUTTON_LED_BLOCKED;
   if (!setButtonLedGuidance(startGuidance, LP_BUTTON_LED_STANDBY)) {
     reportGameFault("could not update Start-button indication");
-    return;
+    return false;
   }
   Serial.print("Waiting for Start: ");
   Serial.println(game.current_player);
@@ -1397,6 +1397,7 @@ void armPlayer(const char *player) {
     Serial.println(
         "Start disabled; clear interval is held at zero while a laser is blocked");
   }
+  return true;
 }
 
 void finishAndAdvance(void) {
@@ -2019,6 +2020,28 @@ int webClearTopResults(String &response) {
   response = ok ? F("{\"ok\":true,\"message\":\"Top 10 cleared\"}")
                 : F("{\"error\":\"storage_failure\"}");
   return ok ? 200 : 500;
+}
+
+int webSubmitPlayer(const char *name, String &response) {
+  if (game.state != LP_GAME_WAIT_PLAYER) {
+    response = F("{\"error\":\"wrong_state\",\"message\":\"The game is not accepting a player name\"}");
+    return 409;
+  }
+  if (name == nullptr || strlen(name) > LP_GAME_PLAYER_NAME_BYTES) {
+    response = F("{\"error\":\"invalid_name\",\"message\":\"Enter a non-blank name of at most 32 characters\"}");
+    return 400;
+  }
+  Serial.println();
+  Serial.print("WEB: player name submitted: ");
+  Serial.println(name);
+  if (!armPlayer(name)) {
+    response = game.state == LP_GAME_FAULT
+                   ? F("{\"error\":\"preparation_failed\",\"message\":\"Player preparation failed; check the nodes\"}")
+                   : F("{\"error\":\"invalid_name\",\"message\":\"Enter a non-blank name of at most 32 characters\"}");
+    return game.state == LP_GAME_FAULT ? 503 : 400;
+  }
+  response = F("{\"ok\":true,\"message\":\"Player accepted; waiting for Start\"}");
+  return 200;
 }
 
 bool readWithRetries(lp_fast_status_register_t &status) {
@@ -2891,6 +2914,7 @@ void setup() {
       .configureAllSensors = webConfigureAllSensors,
       .identifyNode = webIdentifyNode,
       .clearTopResults = webClearTopResults,
+      .submitPlayer = webSubmitPlayer,
   };
   apWebHealthy = controllerWebBegin(controllerConfig, webDataSource,
                                     webActions);
